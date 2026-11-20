@@ -1,31 +1,1184 @@
-<!doctype html>
-<html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#c71932"><title>أُفُق | متجر إلكتروني</title>
+
+<?php
+declare(strict_types=1);
+session_start();
+
+/* =========================================
+   1. إعدادات قاعدة البيانات والإدارة
+========================================= */
+
+$DB_HOST = "localhost";
+$DB_NAME = "ofoq_store";
+$DB_USER = "root";
+$DB_PASS = "";
+
+$ADMIN_USER = "admin";
+$ADMIN_INITIAL_PASSWORD = "ChangeMe@2026"; // غيّرها قبل التشغيل
+
+try {
+    $pdo = new PDO(
+        "mysql:host=$DB_HOST;dbname=$DB_NAME;charset=utf8mb4",
+        $DB_USER,
+        $DB_PASS,
+        [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES => false
+        ]
+    );
+} catch (PDOException $e) {
+    exit("تعذر الاتصال بقاعدة البيانات. راجع إعدادات الاتصال في أعلى الملف.");
+}
+
+/* =========================================
+   2. إنشاء الجداول تلقائياً
+========================================= */
+
+$pdo->exec("
+CREATE TABLE IF NOT EXISTS admins (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(100) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+");
+
+$pdo->exec("
+CREATE TABLE IF NOT EXISTS products (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    price DECIMAL(12,2) NOT NULL,
+    image TEXT,
+    category VARCHAR(100) DEFAULT 'عام',
+    active TINYINT(1) DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+");
+
+$pdo->exec("
+CREATE TABLE IF NOT EXISTS orders (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    customer_name VARCHAR(150) NOT NULL,
+    phone VARCHAR(30) NOT NULL,
+    wilaya VARCHAR(100) NOT NULL,
+    commune VARCHAR(150) NOT NULL,
+    delivery_type VARCHAR(20) NOT NULL,
+    address TEXT,
+    notes TEXT,
+    items LONGTEXT NOT NULL,
+    subtotal DECIMAL(12,2) NOT NULL,
+    delivery_fee DECIMAL(12,2) NOT NULL,
+    total DECIMAL(12,2) NOT NULL,
+    status VARCHAR(30) DEFAULT 'new',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+");
+
+/* إنشاء المدير لأول مرة */
+$count = (int)$pdo->query("SELECT COUNT(*) FROM admins")->fetchColumn();
+
+if ($count === 0) {
+    $stmt = $pdo->prepare(
+        "INSERT INTO admins (username,password_hash) VALUES (?,?)"
+    );
+    $stmt->execute([
+        $ADMIN_USER,
+        password_hash($ADMIN_INITIAL_PASSWORD, PASSWORD_DEFAULT)
+    ]);
+}
+
+/* إضافة المنتجات الأولية إذا كانت القاعدة فارغة */
+$countProducts = (int)$pdo->query("SELECT COUNT(*) FROM products")->fetchColumn();
+
+if ($countProducts === 0) {
+    $initialProducts = [
+        ["طقم منزلي أنيق",4200,"https://images.unsplash.com/photo-1616486338812-3dadae4b4ace?w=700","المنزل"],
+        ["ساعة عصرية",5800,"https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=700","الأناقة"],
+        ["سماعات لاسلكية",3500,"https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=700","الإلكترونيات"],
+        ["حقيبة يومية",4600,"https://images.unsplash.com/photo-1548036328-c9fa89d128fa?w=700","الأناقة"],
+        ["مصباح ديكور",2900,"https://images.unsplash.com/photo-1507473885765-e6ed057f782c?w=700","المنزل"],
+        ["ساعة ذكية",8900,"https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=700","الإلكترونيات"],
+        ["نظارات شمسية",2400,"https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=700","الأناقة"],
+        ["إكسسوارات منزلية",1800,"https://images.unsplash.com/photo-1600210492486-724fe5c67fb0?w=700","المنزل"]
+    ];
+
+    $stmt = $pdo->prepare(
+        "INSERT INTO products (name,price,image,category) VALUES (?,?,?,?)"
+    );
+
+    foreach ($initialProducts as $p) {
+        $stmt->execute($p);
+    }
+}
+
+/* =========================================
+   3. وظائف مساعدة وحماية
+========================================= */
+
+function e($value): string {
+    return htmlspecialchars((string)$value, ENT_QUOTES, "UTF-8");
+}
+
+if (empty($_SESSION["csrf"])) {
+    $_SESSION["csrf"] = bin2hex(random_bytes(32));
+}
+
+function verify_csrf(): void {
+    if (
+        !isset($_POST["csrf"], $_SESSION["csrf"]) ||
+        !hash_equals($_SESSION["csrf"], $_POST["csrf"])
+    ) {
+        http_response_code(403);
+        exit("طلب غير صالح. أعد تحميل الصفحة.");
+    }
+}
+
+function is_admin(): bool {
+    return !empty($_SESSION["admin_id"]);
+}
+
+function require_admin(): void {
+    if (!is_admin()) {
+        header("Location: index.php?page=admin");
+        exit;
+    }
+}
+
+$message = "";
+$error = "";
+
+/* =========================================
+   4. معالجة العمليات
+========================================= */
+
+if ($_SERVER["REQUEST_METHOD"] === "POST") {
+
+    verify_csrf();
+
+    $action = $_POST["action"] ?? "";
+
+    /* تسجيل دخول المدير */
+    if ($action === "login") {
+        $stmt = $pdo->prepare("SELECT * FROM admins WHERE username=?");
+        $stmt->execute([trim($_POST["username"] ?? "")]);
+        $admin = $stmt->fetch();
+
+        if ($admin && password_verify(
+            $_POST["password"] ?? "",
+            $admin["password_hash"]
+        )) {
+            session_regenerate_id(true);
+            $_SESSION["admin_id"] = $admin["id"];
+            header("Location: index.php?page=admin");
+            exit;
+        }
+
+        $error = "اسم المستخدم أو كلمة المرور غير صحيحة";
+    }
+
+    /* تسجيل الخروج */
+    if ($action === "logout") {
+        $_SESSION = [];
+        session_destroy();
+        header("Location: index.php");
+        exit;
+    }
+
+    /* تسجيل طلب الزبون */
+    if ($action === "place_order") {
+        $name = trim($_POST["name"] ?? "");
+        $phone = trim($_POST["phone"] ?? "");
+        $wilaya = trim($_POST["wilaya"] ?? "");
+        $commune = trim($_POST["commune"] ?? "");
+        $type = $_POST["delivery_type"] ?? "";
+        $address = trim($_POST["address"] ?? "");
+        $notes = trim($_POST["notes"] ?? "");
+        $cart = json_decode($_POST["cart"] ?? "{}", true);
+
+        if (
+            $name === "" ||
+            !preg_match('/^[0-9+\s()-]{8,20}$/', $phone) ||
+            $wilaya === "" ||
+            $commune === "" ||
+            !in_array($type, ["home","office"], true) ||
+            !is_array($cart) ||
+            empty($cart)
+        ) {
+            $error = "يرجى التأكد من جميع معلومات الطلب";
+        } elseif ($type === "home" && $address === "") {
+            $error = "يرجى إدخال العنوان للتوصيل إلى المنزل";
+        } else {
+            try {
+                $pdo->beginTransaction();
+
+                $items = [];
+                $subtotal = 0;
+
+                foreach ($cart as $id => $quantity) {
+                    $id = filter_var($id, FILTER_VALIDATE_INT);
+                    $quantity = filter_var($quantity, FILTER_VALIDATE_INT);
+
+                    if (!$id || !$quantity || $quantity < 1 || $quantity > 50) {
+                        throw new Exception("بيانات المنتجات غير صالحة");
+                    }
+
+                    $stmt = $pdo->prepare(
+                        "SELECT id,name,price FROM products WHERE id=? AND active=1"
+                    );
+                    $stmt->execute([$id]);
+                    $product = $stmt->fetch();
+
+                    if (!$product) {
+                        throw new Exception("أحد المنتجات غير متوفر");
+                    }
+
+                    $price = (float)$product["price"];
+                    $subtotal += $price * $quantity;
+
+                    $items[] = [
+                        "id" => (int)$product["id"],
+                        "name" => $product["name"],
+                        "price" => $price,
+                        "quantity" => $quantity
+                    ];
+                }
+
+                // أسعار توصيل تجريبية
+                $deliveryFee = $type === "home" ? 900 : 600;
+                $total = $subtotal + $deliveryFee;
+
+                $stmt = $pdo->prepare("
+                    INSERT INTO orders (
+                        customer_name,phone,wilaya,commune,
+                        delivery_type,address,notes,items,
+                        subtotal,delivery_fee,total
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ");
+
+                $stmt->execute([
+                    $name,$phone,$wilaya,$commune,$type,
+                    $address,$notes,
+                    json_encode($items,JSON_UNESCAPED_UNICODE),
+                    $subtotal,$deliveryFee,$total
+                ]);
+
+                $orderId = (int)$pdo->lastInsertId();
+
+                $pdo->commit();
+
+                $_SESSION["last_order"] = $orderId;
+
+                header("Location: index.php?success=1");
+                exit;
+
+            } catch (Throwable $ex) {
+                if ($pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+                $error = "تعذر تسجيل الطلب. تحقق من المعلومات وحاول مجدداً.";
+            }
+        }
+    }
+
+    /* جميع العمليات التالية خاصة بالمدير */
+    if (in_array($action, ["update_status","add_product","delete_product"], true)) {
+        require_admin();
+    }
+
+    /* تغيير حالة الطلب */
+    if ($action === "update_status") {
+        $id = filter_var($_POST["order_id"] ?? null, FILTER_VALIDATE_INT);
+        $status = $_POST["status"] ?? "";
+
+        $allowed = [
+            "new","confirmed","preparing",
+            "shipped","delivered","cancelled"
+        ];
+
+        if ($id && in_array($status, $allowed, true)) {
+            $stmt = $pdo->prepare("UPDATE orders SET status=? WHERE id=?");
+            $stmt->execute([$status,$id]);
+            $message = "تم تحديث حالة الطلب";
+        }
+    }
+
+    /* إضافة منتج */
+    if ($action === "add_product") {
+        $name = trim($_POST["product_name"] ?? "");
+        $price = (float)($_POST["product_price"] ?? 0);
+        $image = trim($_POST["product_image"] ?? "");
+        $category = trim($_POST["product_category"] ?? "عام");
+
+        if ($name !== "" && $price > 0) {
+            $stmt = $pdo->prepare("
+                INSERT INTO products (name,price,image,category)
+                VALUES (?,?,?,?)
+            ");
+            $stmt->execute([$name,$price,$image,$category]);
+            $message = "تمت إضافة المنتج";
+        } else {
+            $error = "أدخل اسم المنتج وسعراً صحيحاً";
+        }
+    }
+
+    /* حذف منتج */
+    if ($action === "delete_product") {
+        $id = filter_var($_POST["product_id"] ?? null, FILTER_VALIDATE_INT);
+
+        if ($id) {
+            $stmt = $pdo->prepare("UPDATE products SET active=0 WHERE id=?");
+            $stmt->execute([$id]);
+            $message = "تم حذف المنتج من المتجر";
+        }
+    }
+}
+
+/* =========================================
+   5. جلب البيانات
+========================================= */
+
+$products = $pdo->query(
+    "SELECT * FROM products WHERE active=1 ORDER BY id DESC"
+)->fetchAll();
+
+$orders = [];
+$totalOrders = 0;
+$newOrders = 0;
+$totalSales = 0;
+
+if (is_admin()) {
+    $orders = $pdo->query(
+        "SELECT * FROM orders ORDER BY id DESC"
+    )->fetchAll();
+
+    $totalOrders = (int)$pdo->query(
+        "SELECT COUNT(*) FROM orders"
+    )->fetchColumn();
+
+    $newOrders = (int)$pdo->query(
+        "SELECT COUNT(*) FROM orders WHERE status='new'"
+    )->fetchColumn();
+
+    $totalSales = (float)$pdo->query(
+        "SELECT COALESCE(SUM(total),0) FROM orders WHERE status <> 'cancelled'"
+    )->fetchColumn();
+}
+
+$statuses = [
+    "new" => "طلب جديد",
+    "confirmed" => "تم التأكيد",
+    "preparing" => "قيد التحضير",
+    "shipped" => "تم الشحن",
+    "delivered" => "تم التسليم",
+    "cancelled" => "ملغى"
+];
+
+$page = $_GET["page"] ?? "store";
+?>
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>أُفُق | OFOQ STORE</title>
+
 <style>
-:root{--red:#c71932;--red2:#a90f27;--green:#13834a;--ink:#17211d;--muted:#718078;--paper:#f7f8f5;--line:#e8ece8;--white:#fff;--shadow:0 18px 50px #14251b12}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--paper);color:var(--ink);font-family:Tahoma,Arial,sans-serif}button,input,select,textarea{font:inherit}button{cursor:pointer;border:0}.wrap{width:min(1180px,92%);margin:auto}.topbar{background:#14271e;color:#eaf5ee;padding:9px 0;font-size:12px}.topbar .wrap{display:flex;justify-content:space-between;gap:12px}.navbar{background:#fff;position:sticky;top:0;z-index:10;border-bottom:1px solid var(--line)}.navin{height:76px;display:flex;align-items:center;justify-content:space-between;gap:20px}.brand{display:flex;align-items:center;gap:10px;font-weight:900;font-size:23px}.logo{width:42px;height:42px;border-radius:14px;background:linear-gradient(140deg,var(--red),#ef596b);display:grid;place-items:center;color:white;font-size:23px;box-shadow:0 8px 18px #c7193233}.brand small{display:block;color:var(--muted);font-size:10px;font-weight:500;margin-top:2px}.navlinks{display:flex;gap:24px;color:#53635a;font-size:14px}.navlinks a{text-decoration:none;color:inherit}.actions{display:flex;align-items:center;gap:9px}.lang,.cartbtn,.adminbtn{background:white;border:1px solid var(--line);padding:10px 13px;border-radius:12px;font-weight:700}.cartbtn{background:#fff6f7;color:var(--red);position:relative}.count{display:inline-grid;place-items:center;background:var(--red);color:#fff;border-radius:50%;width:19px;height:19px;font-size:11px;margin-inline-start:5px}.hero{padding:54px 0 42px;background:radial-gradient(circle at 12% 25%,#e1f2e8 0,transparent 28%),radial-gradient(circle at 92% 15%,#ffe5e8 0,transparent 25%),linear-gradient(120deg,#fff,#f8fbf7)}.heroGrid{display:grid;grid-template-columns:1.05fr .95fr;align-items:center;gap:35px}.eyebrow{color:var(--green);font-weight:800;font-size:13px;display:inline-flex;align-items:center;gap:8px}.eyebrow:before{content:'';width:22px;height:2px;background:var(--green)}h1{font-size:clamp(34px,5vw,57px);line-height:1.2;margin:17px 0}.hero p{color:var(--muted);line-height:2;max-width:530px}.primary{background:var(--red);color:#fff;padding:14px 22px;border-radius:13px;font-weight:800;box-shadow:0 9px 20px #c7193230;transition:.25s}.primary:hover{background:var(--red2);transform:translateY(-2px)}.secondary{background:#eaf5ee;color:var(--green);padding:14px 20px;border-radius:13px;font-weight:800}.heroBtns{display:flex;gap:10px;flex-wrap:wrap;margin-top:24px}.heroArt{height:345px;border-radius:30px;background:linear-gradient(145deg,#e7f4e9,#fcebed);position:relative;overflow:hidden;display:grid;place-items:center}.heroArt:before,.heroArt:after{content:'';position:absolute;border-radius:50%;background:#ffffff80}.heroArt:before{width:250px;height:250px;top:-90px;left:-45px}.heroArt:after{width:180px;height:180px;bottom:-80px;right:-20px}.heroArt img{width:72%;height:85%;object-fit:cover;border-radius:24px;box-shadow:0 25px 55px #213c2d35;transform:rotate(-4deg);z-index:1}.floating{position:absolute;z-index:2;bottom:24px;right:20px;background:#fff;padding:13px 17px;border-radius:14px;box-shadow:var(--shadow);font-size:13px;font-weight:800}.section{padding:55px 0}.sectionHead{display:flex;align-items:end;justify-content:space-between;gap:20px;margin-bottom:24px}.sectionHead h2{font-size:29px;margin:0 0 8px}.sectionHead p{color:var(--muted);margin:0;font-size:13px}.filters{display:flex;gap:8px;flex-wrap:wrap}.chip{padding:9px 14px;border-radius:30px;background:#fff;border:1px solid var(--line);color:#647269;font-size:12px}.chip.active{background:var(--green);color:#fff;border-color:var(--green)}.products{display:grid;grid-template-columns:repeat(4,1fr);gap:18px}.product{background:#fff;border:1px solid var(--line);border-radius:19px;overflow:hidden;transition:.25s;box-shadow:0 5px 20px #182b1b08}.product:hover{transform:translateY(-5px);box-shadow:var(--shadow)}.pimg{height:190px;background:#f0f4ef;position:relative;overflow:hidden}.pimg img{width:100%;height:100%;object-fit:cover;transition:.4s}.product:hover .pimg img{transform:scale(1.06)}.tag{position:absolute;top:12px;right:12px;background:#fff;color:var(--green);border-radius:20px;padding:6px 10px;font-size:10px;font-weight:800}.pbody{padding:15px}.pbody h3{margin:0 0 7px;font-size:16px}.pbody p{color:var(--muted);font-size:12px;line-height:1.7;margin:0 0 13px}.pfoot{display:flex;align-items:center;justify-content:space-between}.price{font-size:17px;font-weight:900;color:var(--red)}.add{width:38px;height:38px;border-radius:12px;background:#eaf5ee;color:var(--green);font-size:21px;transition:.2s}.add:hover{background:var(--green);color:white}.benefits{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:35px}.benefit{background:white;border:1px solid var(--line);border-radius:16px;padding:20px;display:flex;gap:13px;align-items:center}.bicon{width:42px;height:42px;display:grid;place-items:center;border-radius:13px;background:#fcebed;color:var(--red);font-size:20px}.benefit b{font-size:13px}.benefit small{display:block;color:var(--muted);margin-top:5px}.orderArea{background:#14271e;color:white;padding:52px 0}.orderArea h2{margin:0 0 8px;font-size:29px}.orderArea>div>p{color:#bbcec2;margin:0 0 24px}.orderCard{background:white;color:var(--ink);border-radius:22px;padding:25px;max-width:850px}.formgrid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.field label{display:block;font-size:12px;font-weight:800;margin-bottom:7px}.field input,.field select,.field textarea{width:100%;padding:13px;border:1px solid var(--line);border-radius:11px;background:#fbfcfb;outline:none}.field input:focus,.field select:focus,.field textarea:focus{border-color:var(--green);box-shadow:0 0 0 3px #13834a13}.field.full{grid-column:1/-1}.deliveryChoices{display:flex;gap:10px}.choice{flex:1;border:1px solid var(--line);border-radius:12px;padding:13px;display:flex;gap:8px;align-items:center;font-size:13px}.totals{background:#f5f8f5;border-radius:13px;padding:15px;margin:17px 0;display:grid;grid-template-columns:1fr auto;gap:9px;font-size:13px}.totals strong{color:var(--red);font-size:17px}.footer{padding:28px 0;background:#0e1d15;color:#c4d4c9;font-size:12px}.footer .wrap{display:flex;justify-content:space-between;gap:15px;flex-wrap:wrap}.overlay{position:fixed;inset:0;background:#0a1710a6;z-index:30;display:none;justify-content:flex-end}.overlay.show{display:flex}.drawer{background:#fff;width:min(460px,100%);height:100%;padding:22px;overflow:auto;animation:slide .25s ease}@keyframes slide{from{transform:translateX(40px);opacity:.5}to{transform:none;opacity:1}}.drawerHead{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--line);padding-bottom:15px}.close{background:#f1f4f1;border-radius:10px;width:36px;height:36px;font-size:20px}.cartline{display:grid;grid-template-columns:60px 1fr auto;gap:12px;align-items:center;padding:15px 0;border-bottom:1px solid var(--line)}.cartline img{width:60px;height:60px;object-fit:cover;border-radius:12px}.qty{display:flex;align-items:center;gap:8px;margin-top:7px}.qty button{background:#edf4ee;color:var(--green);width:24px;height:24px;border-radius:7px}.empty{text-align:center;color:var(--muted);padding:45px 0}.modal{position:fixed;inset:0;background:#0a1710aa;z-index:40;display:none;align-items:center;justify-content:center;padding:15px}.modal.show{display:flex}.modalbox{width:min(980px,100%);max-height:92vh;overflow:auto;background:#fff;border-radius:20px;padding:22px}.adminGrid{display:grid;grid-template-columns:190px 1fr;gap:20px}.adminSide{background:#f4f7f4;padding:12px;border-radius:13px}.adminSide button{display:block;width:100%;text-align:right;padding:11px;border-radius:9px;background:transparent;margin:3px 0}.adminSide button.active{background:#e2f2e7;color:var(--green);font-weight:800}.adminMain{min-width:0}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.stat{background:#f6f8f6;border-radius:12px;padding:15px}.stat small{color:var(--muted)}.stat b{display:block;font-size:23px;margin-top:8px}.adminTable{width:100%;border-collapse:collapse;font-size:12px;margin-top:15px}.adminTable th,.adminTable td{padding:11px;border-bottom:1px solid var(--line);text-align:right}.adminTable th{color:var(--muted)}.adminInput{width:110px;padding:8px;border:1px solid var(--line);border-radius:8px}.notice{font-size:12px;color:#7b5b1c;background:#fff7df;border-radius:10px;padding:12px;line-height:1.8;margin:14px 0}.hidden{display:none!important}.toast{position:fixed;bottom:20px;left:20px;background:#14271e;color:#fff;padding:13px 18px;border-radius:12px;z-index:60;opacity:0;transform:translateY(12px);transition:.25s;pointer-events:none}.toast.show{opacity:1;transform:none}
-@media(max-width:850px){.navlinks{display:none}.products{grid-template-columns:repeat(2,1fr)}.heroGrid{grid-template-columns:1fr}.heroArt{height:270px}.benefits{grid-template-columns:1fr}.sectionHead{align-items:start;flex-direction:column}}@media(max-width:520px){.topbar .wrap{font-size:10px}.navin{height:65px}.brand{font-size:19px}.adminbtn{display:none}.products{gap:10px}.pimg{height:145px}.pbody{padding:11px}.pbody h3{font-size:14px}.pbody p{font-size:11px}.price{font-size:14px}.hero{padding-top:35px}.formgrid{grid-template-columns:1fr}.field.full{grid-column:auto}.orderCard{padding:16px}.adminGrid{grid-template-columns:1fr}.adminSide{display:flex;overflow:auto}.adminSide button{white-space:nowrap;width:auto}.stats{grid-template-columns:1fr 1fr}}
-</style></head><body>
-<div class="topbar"><div class="wrap"><span data-i="top">توصيل إلى 58 ولاية • الدفع عند الاستلام</span><span>✦ <span data-i="welcome">تسوّق بسهولة وأمان</span></span></div></div>
-<header class="navbar"><div class="wrap navin"><div class="brand"><div class="logo">أ</div><div>أُفُق<small>OFOQ STORE</small></div></div><nav class="navlinks"><a href="#home" data-i="home">الرئيسية</a><a href="#products" data-i="products">المنتجات</a><a href="#why" data-i="why">لماذا نحن</a><a href="#order" data-i="order">اطلب الآن</a></nav><div class="actions"><button class="lang" id="langBtn">FR</button><button class="adminbtn" id="adminBtn">⚙ الإدارة</button><button class="cartbtn" id="cartBtn">🛒 <span data-i="cart">السلة</span><span class="count" id="cartCount">0</span></button></div></div></header>
-<main><section class="hero" id="home"><div class="wrap heroGrid"><div><span class="eyebrow" data-i="eyebrow">اختيارات مميزة • جودة تستحقها</span><h1 data-i="heroTitle">كل ما تحبّه،<br>في مكان واحد.</h1><p data-i="heroDesc">اكتشف منتجات مختارة بعناية، تجربة شراء سهلة، وخيارات توصيل تناسبك أينما كنت في الجزائر.</p><div class="heroBtns"><button class="primary" onclick="document.querySelector('#products').scrollIntoView()" data-i="shopNow">اكتشف المنتجات ←</button><button class="secondary" onclick="document.querySelector('#order').scrollIntoView()" data-i="orderNow">اطلب الآن</button></div></div><div class="heroArt"><img src="https://images.unsplash.com/photo-1542838132-92c53300491e?auto=format&fit=crop&w=900&q=85" alt="منتجات مختارة"><div class="floating">✦ <span data-i="quality">جودة • ثقة • سرعة</span></div></div></div></section>
-<section class="section" id="products"><div class="wrap"><div class="sectionHead"><div><h2 data-i="productsTitle">منتجاتنا</h2><p data-i="productsSub">تسوّق مجموعتنا المختارة بسهولة.</p></div><div class="filters" id="filters"><button class="chip active" data-cat="all" data-i="all">الكل</button><button class="chip" data-cat="home" data-i="homeCat">المنزل</button><button class="chip" data-cat="style" data-i="styleCat">الأناقة</button><button class="chip" data-cat="tech" data-i="techCat">الإلكترونيات</button></div></div><div class="products" id="productGrid"></div><div class="benefits" id="why"><div class="benefit"><div class="bicon">🚚</div><div><b data-i="benefit1">توصيل مرن</b><small data-i="benefit1s">إلى المنزل أو مكتب التوصيل</small></div></div><div class="benefit"><div class="bicon">🔒</div><div><b data-i="benefit2">طلب آمن</b><small data-i="benefit2s">بيانات طلبك تبقى في هذا النموذج التجريبي</small></div></div><div class="benefit"><div class="bicon">💚</div><div><b data-i="benefit3">خدمة تهتم بك</b><small data-i="benefit3s">تجربة بسيطة وواضحة</small></div></div></div></div></section>
-<section class="orderArea" id="order"><div class="wrap"><h2 data-i="orderTitle">أكمل طلبك</h2><p data-i="orderSub">أدخل معلوماتك واختر طريقة التوصيل المناسبة.</p><div class="orderCard"><form id="orderForm"><div class="formgrid"><div class="field"><label data-i="fullName">الاسم الكامل</label><input id="customerName" required placeholder="الاسم واللقب"></div><div class="field"><label data-i="phone">رقم الهاتف</label><input id="phone" type="tel" required pattern="[0-9+ ]{8,15}" placeholder="05 / 06 / 07"></div><div class="field"><label data-i="wilaya">الولاية</label><select id="wilaya" required><option value="" data-i="chooseWilaya">اختر الولاية</option></select></div><div class="field"><label data-i="commune">البلدية</label><select id="commune" required disabled><option value="" data-i="chooseCommune">اختر البلدية</option></select></div><div class="field full"><label data-i="deliveryType">نوع التوصيل</label><div class="deliveryChoices"><label class="choice"><input type="radio" name="delivery" value="home" checked> <span data-i="homeDelivery">إلى المنزل</span></label><label class="choice"><input type="radio" name="delivery" value="office"> <span data-i="officeDelivery">إلى المكتب</span></label></div></div><div class="field full" id="addressField"><label data-i="address">العنوان بالتفصيل</label><input id="address" placeholder="الحي، الشارع، رقم المنزل..."></div><div class="field full"><label data-i="notes">ملاحظات (اختياري)</label><textarea id="notes" rows="2" placeholder="معلومات إضافية حول الطلب"></textarea></div></div><div class="totals"><span data-i="itemsTotal">مجموع المنتجات</span><b id="itemsTotal">0 دج</b><span data-i="deliveryFee">سعر التوصيل</span><b id="deliveryFee">0 دج</b><span data-i="grandTotal">المجموع النهائي</span><strong id="grandTotal">0 دج</strong></div><button class="primary" type="submit" style="width:100%" data-i="confirm">تأكيد الطلب التجريبي</button><p style="font-size:11px;color:#89958d;line-height:1.8" data-i="demoNote">هذا نموذج تجريبي: لا يتم إرسال الطلب إلى شركة توصيل أو حفظه على خادم.</p></form></div></div></section></main>
-<footer class="footer"><div class="wrap"><span>© 2026 OFOQ STORE — <span data-i="rights">جميع الحقوق محفوظة</span></span><span data-i="footer">واجهة تجريبية قابلة للتخصيص</span></div></footer>
-<div class="overlay" id="cartOverlay"><aside class="drawer"><div class="drawerHead"><h3 data-i="yourCart">سلة المشتريات</h3><button class="close" id="closeCart">×</button></div><div id="cartLines"></div><div class="totals"><span data-i="itemsTotal">مجموع المنتجات</span><b id="cartTotal">0 دج</b></div><button class="primary" style="width:100%" id="goCheckout" data-i="checkout">متابعة الطلب</button></aside></div>
-<div class="modal" id="adminModal"><div class="modalbox"><div class="drawerHead"><div><h2 style="margin:0" data-i="adminTitle">لوحة التحكم</h2><small style="color:#829087" data-i="adminSub">إدارة تجريبية للمتجر</small></div><button class="close" id="closeAdmin">×</button></div><div id="adminLogin" style="max-width:360px;margin:25px auto"><p data-i="adminPassword">أدخل كلمة مرور الإدارة التجريبية</p><input id="adminPass" type="password" placeholder="demo1234" style="width:100%;padding:13px;border:1px solid #ddd;border-radius:10px"><button class="primary" id="loginBtn" style="width:100%;margin-top:12px" data-i="login">دخول</button><div class="notice">كلمة المرور الافتراضية: <b>demo1234</b> — غيّرها داخل كود JavaScript قبل أي استخدام حقيقي.</div></div><div id="adminPanel" class="hidden"><div class="adminGrid"><aside class="adminSide"><button class="active" data-tab="overview" data-i="overview">نظرة عامة</button><button data-tab="fees" data-i="fees">أسعار التوصيل</button><button data-tab="orders" data-i="orders">الطلبات</button><button data-tab="products" data-i="manageProducts">المنتجات</button></aside><div class="adminMain"><div id="tab-overview"><div class="stats"><div class="stat"><small data-i="ordersCount">عدد الطلبات</small><b id="statOrders">0</b></div><div class="stat"><small data-i="sales">قيمة الطلبات</small><b id="statSales">0 دج</b></div><div class="stat"><small data-i="productsCount">المنتجات</small><b id="statProducts">0</b></div></div><div class="notice" data-i="localNotice">البيانات تحفظ محلياً في متصفحك فقط عبر LocalStorage.</div></div><div id="tab-fees" class="hidden"><h3 data-i="feesTitle">تعديل سعر التوصيل حسب الولاية</h3><p style="font-size:12px;color:#77847b" data-i="feesHint">الأسعار التالية تجريبية بالدينار الجزائري، عدّلها حسب شركة التوصيل.</p><div style="overflow:auto"><table class="adminTable"><thead><tr><th data-i="wilaya">الولاية</th><th data-i="homeDelivery">للمنزل</th><th data-i="officeDelivery">للمكتب</th></tr></thead><tbody id="feesTable"></tbody></table></div><button class="primary" id="saveFees" style="margin-top:14px" data-i="save">حفظ الأسعار</button></div><div id="tab-orders" class="hidden"><h3 data-i="ordersTitle">الطلبات المسجلة</h3><div style="overflow:auto"><table class="adminTable"><thead><tr><th>#</th><th data-i="customer">العميل</th><th data-i="phone">الهاتف</th><th data-i="wilaya">الولاية</th><th data-i="grandTotal">المجموع</th></tr></thead><tbody id="ordersTable"></tbody></table></div></div><div id="tab-products" class="hidden"><h3 data-i="manageProducts">إدارة المنتجات</h3><p style="font-size:12px;color:#77847b" data-i="productEditHint">تستطيع تعديل الاسم والسعر من الكود؛ إضافة وحذف المنتجات من لوحة الإدارة التجريبية.</p><div class="field"><label data-i="newProduct">اسم المنتج</label><input id="newProduct" placeholder="اسم المنتج"></div><div class="formgrid" style="margin-top:10px"><div class="field"><label data-i="price">السعر (دج)</label><input id="newPrice" type="number" min="1" placeholder="2500"></div><div class="field"><label data-i="category">التصنيف</label><select id="newCategory"><option value="home">المنزل</option><option value="style">الأناقة</option><option value="tech">الإلكترونيات</option></select></div></div><button class="primary" id="addProduct" style="margin-top:12px" data-i="addProduct">إضافة منتج</button><div id="adminProducts"></div></div></div></div></div></div><div class="toast" id="toast"></div>
+:root {
+    --red:#c71932;
+    --green:#13834a;
+    --dark:#14271e;
+    --paper:#f6f8f5;
+    --line:#e7ece7;
+    --muted:#718078;
+}
+
+* { box-sizing:border-box; }
+
+body {
+    margin:0;
+    font-family:Tahoma,Arial,sans-serif;
+    background:var(--paper);
+    color:#17211d;
+}
+
+button,input,select,textarea {
+    font:inherit;
+}
+
+a { text-decoration:none; }
+
+.wrap {
+    width:min(1150px,94%);
+    margin:auto;
+}
+
+.top {
+    background:var(--dark);
+    color:white;
+    padding:10px;
+    text-align:center;
+    font-size:13px;
+}
+
+header {
+    background:white;
+    border-bottom:1px solid var(--line);
+    position:sticky;
+    top:0;
+    z-index:10;
+}
+
+.nav {
+    min-height:75px;
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    gap:15px;
+}
+
+.logo {
+    color:var(--red);
+    font-size:24px;
+    font-weight:900;
+}
+
+.logo span { color:var(--green); }
+
+.navlinks {
+    display:flex;
+    gap:20px;
+    font-size:14px;
+}
+
+.navlinks a { color:#34463a; }
+
+.btn {
+    border:0;
+    padding:12px 17px;
+    border-radius:11px;
+    background:var(--red);
+    color:white;
+    font-weight:bold;
+    cursor:pointer;
+}
+
+.btn.green { background:var(--green); }
+.btn.light { background:#eaf5ee;color:var(--green); }
+
+.hero {
+    padding:65px 0;
+    background:
+        radial-gradient(circle at 10% 20%,#dff1e4,transparent 30%),
+        radial-gradient(circle at 90% 10%,#ffe4e8,transparent 28%),
+        white;
+}
+
+.hero h1 {
+    font-size:clamp(32px,5vw,55px);
+    line-height:1.4;
+    margin:0 0 15px;
+}
+
+.hero p {
+    color:var(--muted);
+    line-height:2;
+    max-width:600px;
+}
+
+.section { padding:45px 0; }
+
+.section-title {
+    font-size:27px;
+    margin-bottom:25px;
+}
+
+.products {
+    display:grid;
+    grid-template-columns:repeat(4,1fr);
+    gap:17px;
+}
+
+.product {
+    background:white;
+    border:1px solid var(--line);
+    border-radius:17px;
+    overflow:hidden;
+    transition:.2s;
+}
+
+.product:hover {
+    transform:translateY(-4px);
+    box-shadow:0 12px 30px #00000010;
+}
+
+.product img {
+    width:100%;
+    height:190px;
+    object-fit:cover;
+    background:#eee;
+}
+
+.product-body { padding:15px; }
+
+.product h3 { margin:0 0 12px;font-size:16px; }
+
+.price {
+    color:var(--red);
+    font-size:18px;
+    font-weight:900;
+}
+
+.product-bottom {
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    gap:8px;
+}
+
+.order-area {
+    background:var(--dark);
+    padding:50px 0;
+    color:white;
+}
+
+.order-card {
+    background:white;
+    color:#17211d;
+    padding:25px;
+    border-radius:18px;
+    max-width:800px;
+}
+
+.form-grid {
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:14px;
+}
+
+.field label {
+    display:block;
+    font-size:13px;
+    font-weight:bold;
+    margin-bottom:7px;
+}
+
+.field input,.field select,.field textarea {
+    width:100%;
+    border:1px solid var(--line);
+    padding:13px;
+    border-radius:10px;
+    background:#fafcfa;
+}
+
+.field.full { grid-column:1/-1; }
+
+.cart-box {
+    background:#f1f7f2;
+    padding:15px;
+    border-radius:12px;
+    margin:15px 0;
+    color:#17211d;
+}
+
+.cart-row {
+    display:flex;
+    justify-content:space-between;
+    gap:10px;
+    padding:8px 0;
+    border-bottom:1px solid #ddd;
+}
+
+.qty button {
+    padding:3px 9px;
+    border:0;
+    background:#dcefe1;
+    border-radius:5px;
+    cursor:pointer;
+}
+
+.total {
+    font-weight:900;
+    color:var(--red);
+    font-size:20px;
+}
+
+footer {
+    background:#0d1b13;
+    color:#c5d3c9;
+    padding:25px;
+    text-align:center;
+}
+
+.alert {
+    padding:14px;
+    margin:15px auto;
+    border-radius:10px;
+    max-width:1100px;
+    background:#e4f4e8;
+    color:#126b36;
+}
+
+.alert.error {
+    background:#ffe8eb;
+    color:#a90f27;
+}
+
+.admin {
+    width:min(1200px,95%);
+    margin:30px auto;
+}
+
+.stats {
+    display:grid;
+    grid-template-columns:repeat(3,1fr);
+    gap:15px;
+}
+
+.stat,.panel {
+    background:white;
+    border:1px solid var(--line);
+    padding:20px;
+    border-radius:15px;
+    margin-bottom:20px;
+}
+
+.stat small { color:var(--muted); }
+
+.stat strong {
+    display:block;
+    font-size:27px;
+    color:var(--green);
+    margin-top:10px;
+}
+
+.table-wrap { overflow-x:auto; }
+
+table {
+    border-collapse:collapse;
+    width:100%;
+    min-width:850px;
+}
+
+td,th {
+    text-align:right;
+    padding:12px;
+    border-bottom:1px solid var(--line);
+    font-size:13px;
+}
+
+th { color:var(--muted); }
+
+.admin input,.admin select {
+    padding:9px;
+    border:1px solid var(--line);
+    border-radius:8px;
+}
+
+.login {
+    max-width:420px;
+    margin:70px auto;
+    background:white;
+    padding:28px;
+    border-radius:18px;
+}
+
+.login input {
+    width:100%;
+    padding:13px;
+    margin:8px 0;
+    border:1px solid var(--line);
+    border-radius:9px;
+}
+
+.login button { width:100%; }
+
+@media(max-width:850px) {
+    .products { grid-template-columns:repeat(2,1fr); }
+    .navlinks { display:none; }
+}
+
+@media(max-width:550px) {
+    .form-grid { grid-template-columns:1fr; }
+    .field.full { grid-column:auto; }
+    .stats { grid-template-columns:1fr; }
+    .product img { height:145px; }
+    .hero { padding:40px 0; }
+}
+</style>
+</head>
+
+<body>
+
+<div class="top">
+    🚚 توصيل إلى مختلف ولايات الجزائر — الدفع عند الاستلام
+</div>
+
+<header>
+    <div class="wrap nav">
+        <a class="logo" href="index.php">أُفُق <span>OFOQ</span></a>
+
+        <nav class="navlinks">
+            <a href="index.php">الرئيسية</a>
+            <a href="#products">المنتجات</a>
+            <a href="#order">اطلب الآن</a>
+        </nav>
+
+        <div>
+            <a class="btn light" href="#order">سلة المشتريات (<span id="cartCount">0</span>)</a>
+            <a class="btn" href="index.php?page=admin">الإدارة</a>
+        </div>
+    </div>
+</header>
+
+<?php if ($message): ?>
+<div class="alert"><?= e($message) ?></div>
+<?php endif; ?>
+
+<?php if ($error): ?>
+<div class="alert error"><?= e($error) ?></div>
+<?php endif; ?>
+
+<?php if ($page === "admin" && !is_admin()): ?>
+
+<div class="login">
+    <h2>لوحة إدارة OFOQ</h2>
+    <p>تسجيل دخول المدير</p>
+
+    <form method="post">
+        <input type="hidden" name="csrf" value="<?= e($_SESSION["csrf"]) ?>">
+        <input type="hidden" name="action" value="login">
+
+        <input name="username" placeholder="اسم المستخدم" required>
+        <input type="password" name="password" placeholder="كلمة المرور" required>
+
+        <button class="btn">دخول إلى لوحة التحكم</button>
+    </form>
+</div>
+
+<?php elseif ($page === "admin" && is_admin()): ?>
+
+<div class="admin">
+    <h1>لوحة التحكم — OFOQ STORE</h1>
+
+    <form method="post" style="text-align:left;margin-bottom:20px">
+        <input type="hidden" name="csrf" value="<?= e($_SESSION["csrf"]) ?>">
+        <input type="hidden" name="action" value="logout">
+        <button class="btn">تسجيل الخروج</button>
+    </form>
+
+    <div class="stats">
+        <div class="stat">
+            <small>إجمالي الطلبات</small>
+            <strong><?= $totalOrders ?></strong>
+        </div>
+
+        <div class="stat">
+            <small>الطلبات الجديدة</small>
+            <strong><?= $newOrders ?></strong>
+        </div>
+
+        <div class="stat">
+            <small>قيمة الطلبات غير الملغاة</small>
+            <strong><?= number_format($totalSales,0) ?> دج</strong>
+        </div>
+    </div>
+
+    <div class="panel">
+        <h2>إدارة الطلبات</h2>
+
+        <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>رقم</th>
+                    <th>الزبون</th>
+                    <th>الهاتف</th>
+                    <th>الولاية</th>
+                    <th>البلدية</th>
+                    <th>التوصيل</th>
+                    <th>المجموع</th>
+                    <th>التاريخ</th>
+                    <th>الحالة</th>
+                    <th>حفظ</th>
+                </tr>
+            </thead>
+
+            <tbody>
+            <?php foreach ($orders as $o): ?>
+                <tr>
+                    <td>#<?= (int)$o["id"] ?></td>
+                    <td><?= e($o["customer_name"]) ?></td>
+                    <td><a href="tel:<?= e($o["phone"]) ?>"><?= e($o["phone"]) ?></a></td>
+                    <td><?= e($o["wilaya"]) ?></td>
+                    <td><?= e($o["commune"]) ?></td>
+                    <td><?= $o["delivery_type"] === "home" ? "المنزل" : "المكتب" ?></td>
+                    <td><?= number_format((float)$o["total"],0) ?> دج</td>
+                    <td><?= e($o["created_at"]) ?></td>
+
+                    <td>
+                        <form method="post">
+                            <input type="hidden" name="csrf" value="<?= e($_SESSION["csrf"]) ?>">
+                            <input type="hidden" name="action" value="update_status">
+                            <input type="hidden" name="order_id" value="<?= (int)$o["id"] ?>">
+
+                            <select name="status">
+                                <?php foreach ($statuses as $key => $label): ?>
+                                <option value="<?= e($key) ?>" <?= $o["status"] === $key ? "selected" : "" ?>>
+                                    <?= e($label) ?>
+                                </option>
+                                <?php endforeach; ?>
+                            </select>
+                    </td>
+
+                    <td><button class="btn green">تحديث</button></form></td>
+                </tr>
+
+                <tr>
+                    <td colspan="10">
+                        <details>
+                            <summary>تفاصيل الطلب #<?= (int)$o["id"] ?></summary>
+                            <p>العنوان: <?= e($o["address"]) ?></p>
+                            <p>ملاحظات: <?= e($o["notes"]) ?></p>
+
+                            <?php
+                            $orderItems = json_decode($o["items"], true) ?: [];
+                            foreach ($orderItems as $item):
+                            ?>
+                            <p>
+                                <?= e($item["name"]) ?>
+                                — <?= (int)$item["quantity"] ?> ×
+                                <?= number_format((float)$item["price"],0) ?> دج
+                            </p>
+                            <?php endforeach; ?>
+                        </details>
+                    </td>
+                </tr>
+            <?php endforeach; ?>
+
+            <?php if (!$orders): ?>
+                <tr><td colspan="10">لا توجد طلبات حالياً</td></tr>
+            <?php endif; ?>
+            </tbody>
+        </table>
+        </div>
+    </div>
+
+    <div class="panel">
+        <h2>إضافة منتج جديد</h2>
+
+        <form method="post">
+            <input type="hidden" name="csrf" value="<?= e($_SESSION["csrf"]) ?>">
+            <input type="hidden" name="action" value="add_product">
+
+            <p><input name="product_name" placeholder="اسم المنتج" required></p>
+            <p><input type="number" name="product_price" placeholder="السعر بالدينار" min="1" required></p>
+            <p><input name="product_image" placeholder="رابط صورة المنتج"></p>
+            <p><input name="product_category" placeholder="التصنيف"></p>
+
+            <button class="btn green">إضافة المنتج</button>
+        </form>
+    </div>
+
+    <div class="panel">
+        <h2>المنتجات الحالية</h2>
+
+        <?php foreach ($products as $p): ?>
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;border-bottom:1px solid #eee;padding:12px 0">
+                <span><?= e($p["name"]) ?> — <?= number_format((float)$p["price"],0) ?> دج</span>
+
+                <form method="post" onsubmit="return confirm('هل تريد حذف المنتج؟')">
+                    <input type="hidden" name="csrf" value="<?= e($_SESSION["csrf"]) ?>">
+                    <input type="hidden" name="action" value="delete_product">
+                    <input type="hidden" name="product_id" value="<?= (int)$p["id"] ?>">
+                    <button class="btn">حذف</button>
+                </form>
+            </div>
+        <?php endforeach; ?>
+    </div>
+</div>
+
+<?php else: ?>
+
+<section class="hero">
+    <div class="wrap">
+        <h1>كل ما تحبّه،<br>في مكان واحد.</h1>
+        <p>
+            مرحباً بك في أُفُق OFOQ STORE.
+            اكتشف منتجات مختارة بعناية، واطلب بسهولة مع خدمة التوصيل والدفع عند الاستلام.
+        </p>
+        <a href="#products" class="btn">اكتشف المنتجات ←</a>
+        <a href="#order" class="btn green">اطلب الآن</a>
+    </div>
+</section>
+
+<section class="section wrap" id="products">
+    <h2 class="section-title">منتجاتنا</h2>
+
+    <div class="products">
+        <?php foreach ($products as $p): ?>
+        <article class="product">
+            <img
+                src="<?= e($p["image"]) ?>"
+                alt="<?= e($p["name"]) ?>"
+                loading="lazy"
+            >
+
+            <div class="product-body">
+                <h3><?= e($p["name"]) ?></h3>
+
+                <div class="product-bottom">
+                    <span class="price">
+                        <?= number_format((float)$p["price"],0) ?> دج
+                    </span>
+
+                    <button
+                        class="btn green"
+                        onclick="addToCart(<?= (int)$p["id"] ?>)"
+                    >+ أضف</button>
+                </div>
+            </div>
+        </article>
+        <?php endforeach; ?>
+    </div>
+</section>
+
+<section class="order-area" id="order">
+    <div class="wrap">
+        <h2>أكمل طلبك</h2>
+        <p>أدخل معلوماتك لتأكيد الطلب.</p>
+
+        <div class="order-card">
+
+            <h3>سلة المشتريات</h3>
+
+            <div class="cart-box" id="cartLines">
+                السلة فارغة حالياً
+            </div>
+
+            <p>
+                المجموع:
+                <strong class="total" id="cartTotal">0 دج</strong>
+            </p>
+
+            <form method="post" id="orderForm">
+                <input type="hidden" name="csrf" value="<?= e($_SESSION["csrf"]) ?>">
+                <input type="hidden" name="action" value="place_order">
+                <input type="hidden" name="cart" id="cartInput">
+
+                <div class="form-grid">
+
+                    <div class="field">
+                        <label>الاسم الكامل</label>
+                        <input name="name" required maxlength="150">
+                    </div>
+
+                    <div class="field">
+                        <label>رقم الهاتف</label>
+                        <input name="phone" type="tel" required maxlength="20" placeholder="05 أو 06 أو 07">
+                    </div>
+
+                    <div class="field">
+                        <label>الولاية</label>
+                        <input name="wilaya" required placeholder="مثال: سطيف">
+                    </div>
+
+                    <div class="field">
+                        <label>البلدية</label>
+                        <input name="commune" required placeholder="اسم البلدية">
+                    </div>
+
+                    <div class="field full">
+                        <label>نوع التوصيل</label>
+                        <select name="delivery_type" id="deliveryType">
+                            <option value="home">إلى المنزل — 900 دج</option>
+                            <option value="office">إلى مكتب التوصيل — 600 دج</option>
+                        </select>
+                    </div>
+
+                    <div class="field full" id="addressBox">
+                        <label>العنوان بالتفصيل</label>
+                        <input name="address" placeholder="الحي، الشارع، رقم المنزل">
+                    </div>
+
+                    <div class="field full">
+                        <label>ملاحظات إضافية</label>
+                        <textarea name="notes" rows="3"></textarea>
+                    </div>
+
+                </div>
+
+                <div class="cart-box">
+                    <p>مصاريف التوصيل: <strong id="deliveryPrice">900 دج</strong></p>
+                    <p>المجموع النهائي: <strong class="total" id="finalTotal">0 دج</strong></p>
+                </div>
+
+                <button type="submit" class="btn green" style="width:100%">
+                    تأكيد وإرسال الطلب
+                </button>
+            </form>
+
+        </div>
+    </div>
+</section>
+
+<?php endif; ?>
+
+<footer>
+    © <?= date("Y") ?> OFOQ STORE — جميع الحقوق محفوظة
+</footer>
+
 <script>
-const DATA={"wilayas":[{"name":"Adrar","fr":"Adrar"},{"name":"Chlef","fr":"Chlef"},{"name":"Laghouat","fr":"Laghouat"},{"name":"Oum El Bouaghi","fr":"Oum El Bouaghi"},{"name":"Batna","fr":"Batna"},{"name":"Bejaia","fr":"Béjaïa"},{"name":"Biskra","fr":"Biskra"},{"name":"Bechar","fr":"Béchar"},{"name":"Blida","fr":"Blida"},{"name":"Bouira","fr":"Bouira"},{"name":"Tamanrasset","fr":"Tamanrasset"},{"name":"Tebessa","fr":"Tébessa"},{"name":"Tlemcen","fr":"Tlemcen"},{"name":"تيارت","fr":"Tiaret"},{"name":"تيزي وزو","fr":"Tizi Ouzou"},{"name":"الجزائر","fr":"Alger"},{"name":"الجلفة","fr":"Djelfa"},{"name":"جيجل","fr":"Jijel"},{"name":"سطيف","fr":"Sétif"},{"name":"سعيدة","fr":"Saïda"},{"name":"سكيكدة","fr":"Skikda"},{"name":"سيدي بلعباس","fr":"Sidi Bel Abbès"},{"name":"عنابة","fr":"Annaba"},{"name":"قالمة","fr":"Guelma"},{"name":"قسنطينة","fr":"Constantine"},{"name":"المدية","fr":"Médéa"},{"name":"مستغانم","fr":"Mostaganem"},{"name":"المسيلة","fr":"M’Sila"},{"name":"معسكر","fr":"Mascara"},{"name":"ورقلة","fr":"Ouargla"},{"name":"وهران","fr":"Oran"},{"name":"البيض","fr":"El Bayadh"},{"name":"إليزي","fr":"Illizi"},{"name":"برج بوعريريج","fr":"Bordj Bou Arréridj"},{"name":"بومرداس","fr":"Boumerdès"},{"name":"الطارف","fr":"El Tarf"},{"name":"تندوف","fr":"Tindouf"},{"name":"تيسمسيلت","fr":"Tissemsilt"},{"name":"الوادي","fr":"El Oued"},{"name":"خنشلة","fr":"Khenchela"},{"name":"سوق أهراس","fr":"Souk Ahras"},{"name":"تيبازة","fr":"Tipaza"},{"name":"ميلة","fr":"Mila"},{"name":"عين الدفلى","fr":"Aïn Defla"},{"name":"النعامة","fr":"Naâma"},{"name":"عين تموشنت","fr":"Aïn Témouchent"},{"name":"غرداية","fr":"Ghardaïa"},{"name":"غليزان","fr":"Relizane"},{"name":"تيميمون","fr":"Timimoun"},{"name":"برج باجي مختار","fr":"Bordj Badji Mokhtar"},{"name":"أولاد جلال","fr":"Ouled Djellal"},{"name":"بني عباس","fr":"Béni Abbès"},{"name":"عين صالح","fr":"In Salah"},{"name":"عين قزام","fr":"In Guezzam"},{"name":"تقرت","fr":"Touggourt"},{"name":"جانت","fr":"Djanet"},{"name":"المغير","fr":"El M’Ghair"},{"name":"المنيعة","fr":"El Meniaa"}],"municipalities":[{"name":"Adrar","code":"101","wilaya":"Adrar"},{"name":"Akabli","code":"119","wilaya":"Adrar"},{"name":"Aoulef","code":"112","wilaya":"Adrar"},{"name":"Bouda","code":"122","wilaya":"Adrar"},{"name":"Fenoughil","code":"115","wilaya":"Adrar"},{"name":"In Zghmir","code":"105","wilaya":"Adrar"},{"name":"Ouled Ahmed Timmi","code":"121","wilaya":"Adrar"},{"name":"Reggane","code":"104","wilaya":"Adrar"},{"name":"Sali","code":"118","wilaya":"Adrar"},{"name":"Sebaa","code":"126","wilaya":"Adrar"},{"name":"Tamantit","code":"114","wilaya":"Adrar"},{"name":"Tamest","code":"102","wilaya":"Adrar"},{"name":"Timekten","code":"113","wilaya":"Adrar"},{"name":"Tit","code":"106","wilaya":"Adrar"},{"name":"Tsabit","code":"108","wilaya":"Adrar"},{"name":"Zaouiet Kounta","code":null,"wilaya":"Adrar"},{"name":"Abou El Hassan","code":"222","wilaya":"Chlef"},{"name":"Ain Merane","code":"232","wilaya":"Chlef"},{"name":"Benairia","code":"203","wilaya":"Chlef"},{"name":"Beni Bouattab","code":"235","wilaya":"Chlef"},{"name":"Beni Haoua","code":"207","wilaya":"Chlef"},{"name":"Beni Rached","code":"213","wilaya":"Chlef"},{"name":"Boukadir","code":"212","wilaya":"Chlef"},{"name":"Bouzeghaia","code":"231","wilaya":"Chlef"},{"name":"Breira","code":"234","wilaya":"Chlef"},{"name":"Chettia","code":"224","wilaya":"Chlef"},{"name":"Chlef","code":"201","wilaya":"Chlef"},{"name":"Dahra","code":"217","wilaya":"Chlef"},{"name":"El Hadjadj","code":"227","wilaya":"Chlef"},{"name":"El Karimia","code":"204","wilaya":"Chlef"},{"name":"El Marsa","code":"223","wilaya":"Chlef"},{"name":"Harchoun","code":"209","wilaya":"Chlef"},{"name":"Herenfa","code":"215","wilaya":"Chlef"},{"name":"Labiod Medjadja","code":"228","wilaya":"Chlef"},{"name":"Moussadek","code":"226","wilaya":"Chlef"},{"name":"Oued Fodda","code":"229","wilaya":"Chlef"},{"name":"Oued Goussine","code":"216","wilaya":"Chlef"},{"name":"Oued Sly","code":"221","wilaya":"Chlef"},{"name":"Ouled Abbes","code":"218","wilaya":"Chlef"},{"name":"Ouled Ben Abdelkader","code":"230","wilaya":"Chlef"},{"name":"Ouled Fares","code":"210","wilaya":"Chlef"},{"name":"Oum Drou","code":"233","wilaya":"Chlef"},{"name":"Sendjas","code":"219","wilaya":"Chlef"},{"name":"Sidi Abderrahmane","code":"225","wilaya":"Chlef"},{"name":"Sidi Akkacha","code":"211","wilaya":"Chlef"},{"name":"Sobha","code":"208","wilaya":"Chlef"},{"name":"Tadjena","code":"205","wilaya":"Chlef"},{"name":"Talassa","code":"214","wilaya":"Chlef"},{"name":"Taougrite","code":"206","wilaya":"Chlef"},{"name":"Tenes","code":"202","wilaya":"Chlef"},{"name":"Zeboudja","code":"220","wilaya":"Chlef"},{"name":"Aflou","code":"319","wilaya":"Laghouat"},{"name":"Ain Madhi","code":"307","wilaya":"Laghouat"},{"name":"Ain Sidi Ali","code":"311","wilaya":"Laghouat"},{"name":"Beidha","code":"312","wilaya":"Laghouat"},{"name":"Benacer Benchohra","code":"303","wilaya":"Laghouat"},{"name":"Brida","code":"313","wilaya":"Laghouat"},{"name":"El Assafia","code":"320","wilaya":"Laghouat"},{"name":"El Ghicha","code":"314","wilaya":"Laghouat"},{"name":"El Haouaita","code":"323","wilaya":"Laghouat"},{"name":"Gueltat Sidi Saad","code":"310","wilaya":"Laghouat"},{"name":"Hadj Mechri","code":"315","wilaya":"Laghouat"},{"name":"Hassi Delaa","code":"305","wilaya":"Laghouat"},{"name":"Hassi R'mel","code":"306","wilaya":"Laghouat"},{"name":"Kheneg","code":"309","wilaya":"Laghouat"},{"name":"Ksar El Hirane","code":"302","wilaya":"Laghouat"},{"name":"Laghouat","code":"301","wilaya":"Laghouat"},{"name":"Oued M'zi","code":"322","wilaya":"Laghouat"},{"name":"Oued Morra","code":"321","wilaya":"Laghouat"},{"name":"Sebgag","code":"316","wilaya":"Laghouat"},{"name":"Sidi Bouzid","code":"324","wilaya":"Laghouat"},{"name":"Sidi Makhlouf","code":"304","wilaya":"Laghouat"},{"name":"Tadjemout","code":"308","wilaya":"Laghouat"},{"name":"Tadjrouna","code":"318","wilaya":"Laghouat"},{"name":"Taouiala","code":"317","wilaya":"Laghouat"},{"name":"Ain Babouche","code":"408","wilaya":"Oum El Bouaghi"},{"name":"Ain Beida","code":"402","wilaya":"Oum El Bouaghi"},{"name":"Ain Diss","code":"415","wilaya":"Oum El Bouaghi"},{"name":"Ain Fekroune","code":"425","wilaya":"Oum El Bouaghi"},{"name":"Ain Kercha","code":"412","wilaya":"Oum El Bouaghi"},{"name":"Ain M'lila","code":"403","wilaya":"Oum El Bouaghi"},{"name":"Ain Zitoun","code":"427","wilaya":"Oum El Bouaghi"},{"name":"Behir Chergui","code":"404","wilaya":"Oum El Bouaghi"},{"name":"Berriche","code":"409","wilaya":"Oum El Bouaghi"},{"name":"Bir Chouhada","code":"421","wilaya":"Oum El Bouaghi"},{"name":"Dhala","code":"411","wilaya":"Oum El Bouaghi"},{"name":"El Amiria","code":"405","wilaya":"Oum El Bouaghi"},{"name":"El Belala","code":"407","wilaya":"Oum El Bouaghi"},{"name":"El Djazia","code":"414","wilaya":"Oum El Bouaghi"},{"name":"El Fedjoudj Boughrara Sa","code":"419","wilaya":"Oum El Bouaghi"},{"name":"El Harmilia","code":"429","wilaya":"Oum El Bouaghi"},{"name":"Fkirina","code":"416","wilaya":"Oum El Bouaghi"},{"name":"Hanchir Toumghani","code":"413","wilaya":"Oum El Bouaghi"},{"name":"Ksar Sbahi","code":"422","wilaya":"Oum El Bouaghi"},{"name":"Meskiana","code":"424","wilaya":"Oum El Bouaghi"},{"name":"Oued Nini","code":"423","wilaya":"Oum El Bouaghi"},{"name":"Ouled Gacem","code":"428","wilaya":"Oum El Bouaghi"},{"name":"Ouled Hamla","code":"410","wilaya":"Oum El Bouaghi"},{"name":"Ouled Zouai","code":"420","wilaya":"Oum El Bouaghi"},{"name":"Oum El Bouaghi","code":"401","wilaya":"Oum El Bouaghi"},{"name":"Rahia","code":"426","wilaya":"Oum El Bouaghi"},{"name":"Sigus","code":"406","wilaya":"Oum El Bouaghi"},{"name":"Souk Naamane","code":"417","wilaya":"Oum El Bouaghi"},{"name":"Zorg","code":"418","wilaya":"Oum El Bouaghi"},{"name":"Ain Djasser","code":"519","wilaya":"Batna"},{"name":"Ain Touta","code":"545","wilaya":"Batna"},{"name":"Ain Yagout","code":"522","wilaya":"Batna"},{"name":"Arris","code":"516","wilaya":"Batna"},{"name":"Azil Abedelkader","code":"515","wilaya":"Batna"},{"name":"Barika","code":"542","wilaya":"Batna"},{"name":"Batna","code":"501","wilaya":"Batna"},{"name":"Beni Foudhala El Hakania","code":"532","wilaya":"Batna"},{"name":"Bitam","code":"514","wilaya":"Batna"},{"name":"Boulhilat","code":"560","wilaya":"Batna"},{"name":"Boumagueur","code":"541","wilaya":"Batna"},{"name":"Boumia","code":"559","wilaya":"Batna"},{"name":"Bouzina","code":"535","wilaya":"Batna"},{"name":"Chemora","code":"536","wilaya":"Batna"},{"name":"Chir","code":"552","wilaya":"Batna"},{"name":"Djerma","code":"513","wilaya":"Batna"},{"name":"Djezzar","code":"543","wilaya":"Batna"},{"name":"El Hassi","code":"557","wilaya":"Batna"},{"name":"El Madher","code":"507","wilaya":"Batna"},{"name":"Fesdis","code":"523","wilaya":"Batna"},{"name":"Foum Toub","code":"531","wilaya":"Batna"},{"name":"Ghassira","code":"502","wilaya":"Batna"},{"name":"Gosbat","code":"539","wilaya":"Batna"},{"name":"Guigba","code":"510","wilaya":"Batna"},{"name":"Hidoussa","code":"546","wilaya":"Batna"},{"name":"Ichmoul","code":"530","wilaya":"Batna"},{"name":"Inoughissen","code":"511","wilaya":"Batna"},{"name":"Kimmel","code":"517","wilaya":"Batna"},{"name":"Ksar Bellezma","code":"528","wilaya":"Batna"},{"name":"Larbaa","code":"561","wilaya":"Batna"},{"name":"Lazrou","code":"558","wilaya":"Batna"},{"name":"Lemsane","code":"527","wilaya":"Batna"},{"name":"M Doukal","code":"555","wilaya":"Batna"},{"name":"Maafa","code":"503","wilaya":"Batna"},{"name":"Menaa","code":"506","wilaya":"Batna"},{"name":"Merouana","code":"504","wilaya":"Batna"},{"name":"N Gaous","code":"509","wilaya":"Batna"},{"name":"Oued Chaaba","code":"537","wilaya":"Batna"},{"name":"Oued El Ma","code":"533","wilaya":"Batna"},{"name":"Oued Taga","code":"548","wilaya":"Batna"},{"name":"Ouled Ammar","code":"556","wilaya":"Batna"},{"name":"Ouled Aouf","code":"540","wilaya":"Batna"},{"name":"Ouled Fadel","code":"549","wilaya":"Batna"},{"name":"Ouled Sellem","code":"520","wilaya":"Batna"},{"name":"Ouled Si Slimane","code":"553","wilaya":"Batna"},{"name":"Ouyoun El Assafir","code":"512","wilaya":"Batna"},{"name":"Rahbat","code":"525","wilaya":"Batna"},{"name":"Ras El Aioun","code":"551","wilaya":"Batna"},{"name":"Sefiane","code":"524","wilaya":"Batna"},{"name":"Seggana","code":"529","wilaya":"Batna"},{"name":"Seriana","code":"505","wilaya":"Batna"},{"name":"T Kout","code":"544","wilaya":"Batna"},{"name":"Talkhamt","code":"534","wilaya":"Batna"},{"name":"Taxlent","code":"538","wilaya":"Batna"},{"name":"Tazoult","code":"508","wilaya":"Batna"},{"name":"Teniet El Abed","code":"547","wilaya":"Batna"},{"name":"Tighanimine","code":"526","wilaya":"Batna"},{"name":"Tigharghar","code":"521","wilaya":"Batna"},{"name":"Tilatou","code":"518","wilaya":"Batna"},{"name":"Timgad","code":"550","wilaya":"Batna"},{"name":"Zanet El Beida","code":"554","wilaya":"Batna"},{"name":"Adekar","code":"624","wilaya":"Bejaia"},{"name":"Ait R'zine","code":"628","wilaya":"Bejaia"},{"name":"Ait Smail","code":"647","wilaya":"Bejaia"},{"name":"Akbou","code":"625","wilaya":"Bejaia"},{"name":"Akfadou","code":"642","wilaya":"Bejaia"},{"name":"Amalou","code":"616","wilaya":"Bejaia"},{"name":"Amizour","code":"602","wilaya":"Bejaia"},{"name":"Aokas","code":"622","wilaya":"Bejaia"},{"name":"Barbacha","code":"634","wilaya":"Bejaia"},{"name":"Bejaia","code":"601","wilaya":"Bejaia"},{"name":"Beni Dejllil","code":"623","wilaya":"Bejaia"},{"name":"Beni K'sila","code":"635","wilaya":"Bejaia"},{"name":"Beni Mallikeche","code":"638","wilaya":"Bejaia"},{"name":"Benimaouche","code":"650","wilaya":"Bejaia"},{"name":"Boudjellil","code":"652","wilaya":"Bejaia"},{"name":"Bouhamza","code":"637","wilaya":"Bejaia"},{"name":"Boukhelifa","code":"648","wilaya":"Bejaia"},{"name":"Chellata","code":"605","wilaya":"Bejaia"},{"name":"Chemini","code":"629","wilaya":"Bejaia"},{"name":"Darghina","code":"620","wilaya":"Bejaia"},{"name":"Dra El Caid","code":"645","wilaya":"Bejaia"},{"name":"El Kseur","code":"640","wilaya":"Bejaia"},{"name":"Fenaia Il Maten","code":"618","wilaya":"Bejaia"},{"name":"Feraoun","code":"603","wilaya":"Bejaia"},{"name":"Ighil Ali","code":"617","wilaya":"Bejaia"},{"name":"Ighram","code":"615","wilaya":"Bejaia"},{"name":"Kendira","code":"613","wilaya":"Bejaia"},{"name":"Kherrata","code":"644","wilaya":"Bejaia"},{"name":"Leflaye","code":"643","wilaya":"Bejaia"},{"name":"M'cisna","code":"609","wilaya":"Bejaia"},{"name":"Melbou","code":"641","wilaya":"Bejaia"},{"name":"Oued Ghir","code":"651","wilaya":"Bejaia"},{"name":"Ouzellaguene","code":"636","wilaya":"Bejaia"},{"name":"Seddouk","code":"626","wilaya":"Bejaia"},{"name":"Sidi Aich","code":"639","wilaya":"Bejaia"},{"name":"Sidi Ayad","code":"621","wilaya":"Bejaia"},{"name":"Smaoun","code":"612","wilaya":"Bejaia"},{"name":"Souk El Tenine","code":"608","wilaya":"Bejaia"},{"name":"Souk Oufella","code":"630","wilaya":"Bejaia"},{"name":"Tala Hamza","code":"633","wilaya":"Bejaia"},{"name":"Tamokra","code":"606","wilaya":"Bejaia"},{"name":"Tamridjet","code":"646","wilaya":"Bejaia"},{"name":"Taourit Ighil","code":"604","wilaya":"Bejaia"},{"name":"Taskriout","code":"631","wilaya":"Bejaia"},{"name":"Tazmalt","code":"627","wilaya":"Bejaia"},{"name":"Tibane","code":"632","wilaya":"Bejaia"},{"name":"Tichy","code":"611","wilaya":"Bejaia"},{"name":"Tifra","code":"614","wilaya":"Bejaia"},{"name":"Timezrit","code":"607","wilaya":"Bejaia"},{"name":"Tinebdar","code":"610","wilaya":"Bejaia"},{"name":"Tizi N'berber","code":"649","wilaya":"Bejaia"},{"name":"Toudja","code":"619","wilaya":"Bejaia"},{"name":"Ain Naga","code":"714","wilaya":"Biskra"},{"name":"Ain Zaatout","code":"718","wilaya":"Biskra"},{"name":"Biskra","code":"701","wilaya":"Biskra"},{"name":"Bordj Ben Azzouz","code":"727","wilaya":"Biskra"},{"name":"Bouchagroun","code":"729","wilaya":"Biskra"},{"name":"Branis","code":"703","wilaya":"Biskra"},{"name":"Chetma","code":"704","wilaya":"Biskra"},{"name":"Djemorah","code":"720","wilaya":"Biskra"},{"name":"El Feidh","code":"716","wilaya":"Biskra"},{"name":"El Ghrous","code":"731","wilaya":"Biskra"},{"name":"El Hadjab","code":"732","wilaya":"Biskra"},{"name":"El Haouch","code":"713","wilaya":"Biskra"},{"name":"El Kantara","code":"717","wilaya":"Biskra"},{"name":"El Outaya","code":"719","wilaya":"Biskra"},{"name":"Foughala","code":"726","wilaya":"Biskra"},{"name":"Khenguet Sidi Nadji","code":"733","wilaya":"Biskra"},{"name":"Lichana","code":"723","wilaya":"Biskra"},{"name":"Lioua","code":"722","wilaya":"Biskra"},{"name":"M'chouneche","code":"712","wilaya":"Biskra"},{"name":"M'lili","code":"725","wilaya":"Biskra"},{"name":"Mekhadma","code":"730","wilaya":"Biskra"},{"name":"Meziraa","code":"728","wilaya":"Biskra"},{"name":"Oumache","code":"702","wilaya":"Biskra"},{"name":"Ourlal","code":"724","wilaya":"Biskra"},{"name":"Sidi Okba","code":"711","wilaya":"Biskra"},{"name":"Tolga","code":"721","wilaya":"Biskra"},{"name":"Zeribet El Oued","code":"715","wilaya":"Biskra"},{"name":"Abadla","code":"817","wilaya":"Bechar"},{"name":"Bechar","code":"801","wilaya":"Bechar"},{"name":"Beni Ounif","code":"821","wilaya":"Bechar"},{"name":"Boukais","code":"815","wilaya":"Bechar"},{"name":"Erg Ferradj","code":"802","wilaya":"Bechar"},{"name":"Kenadsa","code":"810","wilaya":"Bechar"},{"name":"Lahmar","code":"806","wilaya":"Bechar"},{"name":"Mechraa H.boumediene","code":"809","wilaya":"Bechar"},{"name":"Meridja","code":"804","wilaya":"Bechar"},{"name":"Mogheul","code":"816","wilaya":"Bechar"},{"name":"Taghit","code":"813","wilaya":"Bechar"},{"name":"Ain Romana","code":"924","wilaya":"Blida"},{"name":"Beni Mered","code":"921","wilaya":"Blida"},{"name":"Beni Tamou","code":"919","wilaya":"Blida"},{"name":"Benkhelil","code":"910","wilaya":"Blida"},{"name":"Blida","code":"901","wilaya":"Blida"},{"name":"Bouarfa","code":"920","wilaya":"Blida"},{"name":"Boufarik","code":"916","wilaya":"Blida"},{"name":"Bougara","code":"922","wilaya":"Blida"},{"name":"Bouinan","code":"903","wilaya":"Blida"},{"name":"Chebli","code":"902","wilaya":"Blida"},{"name":"Chiffa","code":"908","wilaya":"Blida"},{"name":"Chrea","code":"906","wilaya":"Blida"},{"name":"Djebabra","code":"925","wilaya":"Blida"},{"name":"El Affroun","code":"907","wilaya":"Blida"},{"name":"Guerrouaou","code":"923","wilaya":"Blida"},{"name":"Hammam Melouane","code":"909","wilaya":"Blida"},{"name":"Larbaa","code":"917","wilaya":"Blida"},{"name":"Meftah","code":"914","wilaya":"Blida"},{"name":"Mouzaia","code":"912","wilaya":"Blida"},{"name":"Oued Djer","code":"918","wilaya":"Blida"},{"name":"Oued El Alleug","code":"904","wilaya":"Blida"},{"name":"Ouled Slama","code":"915","wilaya":"Blida"},{"name":"Ouled Yaich","code":"905","wilaya":"Blida"},{"name":"Souhane","code":"913","wilaya":"Blida"},{"name":"Souma","code":"911","wilaya":"Blida"},{"name":"Aghbalou","code":"1027","wilaya":"Bouira"},{"name":"Ahl El Ksar","code":"1022","wilaya":"Bouira"},{"name":"Ain Bessem","code":"1035","wilaya":"Bouira"},{"name":"Ain El Hadjar","code":"1025","wilaya":"Bouira"},{"name":"Ain Laloui","code":"1041","wilaya":"Bouira"},{"name":"Ain Turk","code":"1029","wilaya":"Bouira"},{"name":"Ait Laaziz","code":"1008","wilaya":"Bouira"},{"name":"Aomar","code":"1016","wilaya":"Bouira"},{"name":"Bechloul","code":"1033","wilaya":"Bouira"},{"name":"Bir Ghbalou","code":"1036","wilaya":"Bouira"},{"name":"Bordj Okhriss","code":"1018","wilaya":"Bouira"},{"name":"Bouderbala","code":"1023","wilaya":"Bouira"},{"name":"Bouira","code":"1001","wilaya":"Bouira"},{"name":"Boukram","code":"1034","wilaya":"Bouira"},{"name":"Chorfa","code":"1017","wilaya":"Bouira"},{"name":"Dechmia","code":"1031","wilaya":"Bouira"},{"name":"Dirah","code":"1007","wilaya":"Bouira"},{"name":"Djebahia","code":"1026","wilaya":"Bouira"},{"name":"El Adjiba","code":"1019","wilaya":"Bouira"},{"name":"El Asnam","code":"1002","wilaya":"Bouira"},{"name":"El Hachimia","code":"1015","wilaya":"Bouira"},{"name":"El Hakimia","code":"1020","wilaya":"Bouira"},{"name":"El Khabouzia","code":"1021","wilaya":"Bouira"},{"name":"El Mokrani","code":"1044","wilaya":"Bouira"},{"name":"Guerrouma","code":"1003","wilaya":"Bouira"},{"name":"Hadjera Zerga","code":"1042","wilaya":"Bouira"},{"name":"Haizer","code":"1012","wilaya":"Bouira"},{"name":"Hanif","code":"1006","wilaya":"Bouira"},{"name":"Kadiria","code":"1005","wilaya":"Bouira"},{"name":"Lakhdaria","code":"1013","wilaya":"Bouira"},{"name":"M Chedallah","code":"1037","wilaya":"Bouira"},{"name":"Maala","code":"1014","wilaya":"Bouira"},{"name":"Mamora","code":"1039","wilaya":"Bouira"},{"name":"Mezdour","code":"1011","wilaya":"Bouira"},{"name":"Oued El Berdi","code":"1045","wilaya":"Bouira"},{"name":"Ouled Rached","code":"1040","wilaya":"Bouira"},{"name":"Raouraoua","code":"1010","wilaya":"Bouira"},{"name":"Ridane","code":"1032","wilaya":"Bouira"},{"name":"Saharidj","code":"1030","wilaya":"Bouira"},{"name":"Souk El Khemis","code":"1004","wilaya":"Bouira"},{"name":"Sour El Ghozlane","code":"1038","wilaya":"Bouira"},{"name":"Taghzout","code":"1009","wilaya":"Bouira"},{"name":"Taguedite","code":"1028","wilaya":"Bouira"},{"name":"Taourirt","code":"1043","wilaya":"Bouira"},{"name":"Z'barbar","code":"1024","wilaya":"Bouira"},{"name":"Abalessa","code":"1102","wilaya":"Tamanrasset"},{"name":"Ain Amguel","code":"1109","wilaya":"Tamanrasset"},{"name":"Idles","code":"1105","wilaya":"Tamanrasset"},{"name":"Tamanrasset","code":"1101","wilaya":"Tamanrasset"},{"name":"Tazrouk","code":"1106","wilaya":"Tamanrasset"},{"name":"Ain Zerga","code":"1223","wilaya":"Tebessa"},{"name":"Bedjene","code":"1226","wilaya":"Tebessa"},{"name":"Bekkaria","code":"1217","wilaya":"Tebessa"},{"name":"Bir Dheheb","code":"1214","wilaya":"Tebessa"},{"name":"Bir El Ater","code":"1202","wilaya":"Tebessa"},{"name":"Bir Mokkadem","code":"1210","wilaya":"Tebessa"},{"name":"Boukhadra","code":"1218","wilaya":"Tebessa"},{"name":"Boulhaf Dyr","code":"1225","wilaya":"Tebessa"},{"name":"Cheria","code":"1203","wilaya":"Tebessa"},{"name":"El Aouinet","code":"1205","wilaya":"Tebessa"},{"name":"El Houidjbet","code":"1206","wilaya":"Tebessa"},{"name":"El Kouif","code":"1211","wilaya":"Tebessa"},{"name":"El Malabiod","code":"1220","wilaya":"Tebessa"},{"name":"El Meridj","code":"1224","wilaya":"Tebessa"},{"name":"El Mezeraa","code":"1227","wilaya":"Tebessa"},{"name":"El Ogla","code":"1213","wilaya":"Tebessa"},{"name":"El Ogla El Malha","code":"1215","wilaya":"Tebessa"},{"name":"Ferkane","code":"1228","wilaya":"Tebessa"},{"name":"Guorriguer","code":"1216","wilaya":"Tebessa"},{"name":"Hammamet","code":"1208","wilaya":"Tebessa"},{"name":"Morssot","code":"1212","wilaya":"Tebessa"},{"name":"Negrine","code":"1209","wilaya":"Tebessa"},{"name":"Ouenza","code":"1219","wilaya":"Tebessa"},{"name":"Oum Ali","code":"1221","wilaya":"Tebessa"},{"name":"Saf Saf El Ouesra","code":"1207","wilaya":"Tebessa"},{"name":"Stah Guentis","code":"1204","wilaya":"Tebessa"},{"name":"Tebessa","code":"1201","wilaya":"Tebessa"},{"name":"Telidjen","code":"1222","wilaya":"Tebessa"},{"name":"Ain Fettah","code":"1331","wilaya":"Tlemcen"},{"name":"Ain Fezza","code":"1312","wilaya":"Tlemcen"},{"name":"Ain Ghoraba","code":"1349","wilaya":"Tlemcen"},{"name":"Ain Kebira","code":"1353","wilaya":"Tlemcen"},{"name":"Ain Nehala","code":"1325","wilaya":"Tlemcen"},{"name":"Ain Tallout","code":"1303","wilaya":"Tlemcen"},{"name":"Ain Youcef","code":"1315","wilaya":"Tlemcen"},{"name":"Amieur","code":"1314","wilaya":"Tlemcen"},{"name":"Azails","code":"1321","wilaya":"Tlemcen"},{"name":"Bab El Assa","code":"1318","wilaya":"Tlemcen"},{"name":"Beni Bahdel","code":"1342","wilaya":"Tlemcen"},{"name":"Beni Boussaid","code":"1338","wilaya":"Tlemcen"},{"name":"Beni Khaled","code":"1348","wilaya":"Tlemcen"},{"name":"Beni Mester","code":"1302","wilaya":"Tlemcen"},{"name":"Beni Ouarsous","code":"1336","wilaya":"Tlemcen"},{"name":"Beni Smiel","code":"1352","wilaya":"Tlemcen"},{"name":"Beni Snous","code":"1317","wilaya":"Tlemcen"},{"name":"Bensekrane","code":"1324","wilaya":"Tlemcen"},{"name":"Bouhlou","code":"1347","wilaya":"Tlemcen"},{"name":"Bouihi","code":"1343","wilaya":"Tlemcen"},{"name":"Chetouane","code":"1350","wilaya":"Tlemcen"},{"name":"Dar Yaghmouracene","code":"1319","wilaya":"Tlemcen"},{"name":"Djebala","code":"1309","wilaya":"Tlemcen"},{"name":"El Aricha","code":"1332","wilaya":"Tlemcen"},{"name":"El Fehoul","code":"1305","wilaya":"Tlemcen"},{"name":"El Gor","code":"1310","wilaya":"Tlemcen"},{"name":"Fellaoucene","code":"1320","wilaya":"Tlemcen"},{"name":"Ghazaouet","code":"1307","wilaya":"Tlemcen"},{"name":"Hammam Boughrara","code":"1328","wilaya":"Tlemcen"},{"name":"Hennaya","code":"1326","wilaya":"Tlemcen"},{"name":"Honaine","code":"1344","wilaya":"Tlemcen"},{"name":"Maghnia","code":"1327","wilaya":"Tlemcen"},{"name":"Mansourah","code":"1351","wilaya":"Tlemcen"},{"name":"Marsa Ben M'hidi","code":"1339","wilaya":"Tlemcen"},{"name":"Msirda Fouaga","code":"1330","wilaya":"Tlemcen"},{"name":"Nedroma","code":"1340","wilaya":"Tlemcen"},{"name":"Oued Chouly","code":"1311","wilaya":"Tlemcen"},{"name":"Ouled Mimoun","code":"1313","wilaya":"Tlemcen"},{"name":"Ouled Riyah","code":"1346","wilaya":"Tlemcen"},{"name":"Remchi","code":"1304","wilaya":"Tlemcen"},{"name":"Sabra","code":"1306","wilaya":"Tlemcen"},{"name":"Sebbaa Chioukh","code":"1322","wilaya":"Tlemcen"},{"name":"Sebdou","code":"1335","wilaya":"Tlemcen"},{"name":"Sidi Abdelli","code":"1334","wilaya":"Tlemcen"},{"name":"Sidi Djilali","code":"1341","wilaya":"Tlemcen"},{"name":"Sidi Medjahed","code":"1337","wilaya":"Tlemcen"},{"name":"Souahlia","code":"1329","wilaya":"Tlemcen"},{"name":"Souani","code":"1308","wilaya":"Tlemcen"},{"name":"Souk Tleta","code":"1333","wilaya":"Tlemcen"},{"name":"Terny Beni Hediel","code":"1323","wilaya":"Tlemcen"},{"name":"Tianet","code":"1345","wilaya":"Tlemcen"},{"name":"Tlemcen","code":"1301","wilaya":"Tlemcen"},{"name":"Zenata","code":"1316","wilaya":"Tlemcen"},{"name":"Ain Bouchekif","code":"1403","wilaya":"تيارت"},{"name":"Ain Deheb","code":"1406","wilaya":"تيارت"},{"name":"Ain El Hadid","code":"1418","wilaya":"تيارت"},{"name":"Ain Kermes","code":"1428","wilaya":"تيارت"},{"name":"Ain Zarit","code":"1405","wilaya":"تيارت"},{"name":"Bougara","code":"1440","wilaya":"تيارت"},{"name":"Chehaima","code":"1436","wilaya":"تيارت"},{"name":"Dahmouni","code":"1413","wilaya":"تيارت"},{"name":"Djebilet Rosfa","code":"1419","wilaya":"تيارت"},{"name":"Djillali Ben Amar","code":"1424","wilaya":"تيارت"},{"name":"Faidja","code":"1441","wilaya":"تيارت"},{"name":"Frenda","code":"1427","wilaya":"تيارت"},{"name":"Guertoufa","code":"1422","wilaya":"تيارت"},{"name":"Hamadia","code":"1435","wilaya":"تيارت"},{"name":"Ksar Chellala","code":"1429","wilaya":"تيارت"},{"name":"Madna","code":"1410","wilaya":"تيارت"},{"name":"Mahdia","code":"1415","wilaya":"تيارت"},{"name":"Mechraa Safa","code":"1434","wilaya":"تيارت"},{"name":"Medrissa","code":"1408","wilaya":"تيارت"},{"name":"Medroussa","code":"1402","wilaya":"تيارت"},{"name":"Meghila","code":"1421","wilaya":"تيارت"},{"name":"Mellakou","code":"1412","wilaya":"تيارت"},{"name":"Nadorah","code":"1431","wilaya":"تيارت"},{"name":"Naima","code":"1420","wilaya":"تيارت"},{"name":"Oued Lilli","code":"1433","wilaya":"تيارت"},{"name":"Rahouia","code":"1414","wilaya":"تيارت"},{"name":"Rechaiga","code":"1430","wilaya":"تيارت"},{"name":"Sebaine","code":"1425","wilaya":"تيارت"},{"name":"Sebt","code":"1411","wilaya":"تيارت"},{"name":"Serghine","code":"1439","wilaya":"تيارت"},{"name":"Si Abdelghani","code":"1417","wilaya":"تيارت"},{"name":"Sidi Abderrahmane","code":"1438","wilaya":"تيارت"},{"name":"Sidi Ali Mellal","code":"1404","wilaya":"تيارت"},{"name":"Sidi Bakhti","code":"1407","wilaya":"تيارت"},{"name":"Sidi Hosni","code":"1423","wilaya":"تيارت"},{"name":"Sougueur","code":"1416","wilaya":"تيارت"},{"name":"Tagdemt","code":"1432","wilaya":"تيارت"},{"name":"Takhemaret","code":"1437","wilaya":"تيارت"},{"name":"Tiaret","code":"1401","wilaya":"تيارت"},{"name":"Tidda","code":"1442","wilaya":"تيارت"},{"name":"Tousnina","code":"1426","wilaya":"تيارت"},{"name":"Zmalet El Emir Abdelkade","code":"1409","wilaya":"تيارت"},{"name":"Abi Youcef","code":"1531","wilaya":"تيزي وزو"},{"name":"Aghribs","code":"1553","wilaya":"تيزي وزو"},{"name":"Agouni Gueghrane","code":"1561","wilaya":"تيزي وزو"},{"name":"Ain El Hammam","code":"1502","wilaya":"تيزي وزو"},{"name":"Ain Zaouia","code":"1525","wilaya":"تيزي وزو"},{"name":"Ait Aggouacha","code":"1535","wilaya":"تيزي وزو"},{"name":"Ait Bouaddou","code":"1565","wilaya":"تيزي وزو"},{"name":"Ait Boumehdi","code":"1530","wilaya":"تيزي وزو"},{"name":"Ait Chafaa","code":"1513","wilaya":"تيزي وزو"},{"name":"Ait Khellili","code":"1558","wilaya":"تيزي وزو"},{"name":"Ait Mahmoud","code":"1528","wilaya":"تيزي وزو"},{"name":"Ait Oumalou","code":"1542","wilaya":"تيزي وزو"},{"name":"Ait Toudert","code":"1567","wilaya":"تيزي وزو"},{"name":"Ait Yahia","code":"1527","wilaya":"تيزي وزو"},{"name":"Ait Yahia Moussa","code":"1556","wilaya":"تيزي وزو"},{"name":"Akbil","code":"1503","wilaya":"تيزي وزو"},{"name":"Akerrou","code":"1544","wilaya":"تيزي وزو"},{"name":"Assi Youcef","code":"1566","wilaya":"تيزي وزو"},{"name":"Azazga","code":"1518","wilaya":"تيزي وزو"},{"name":"Azeffoun","code":"1537","wilaya":"تيزي وزو"},{"name":"Beni Aissi","code":"1515","wilaya":"تيزي وزو"},{"name":"Beni Douala","code":"1532","wilaya":"تيزي وزو"},{"name":"Beni Yenni","code":"1552","wilaya":"تيزي وزو"},{"name":"Beni Zikki","code":"1546","wilaya":"تيزي وزو"},{"name":"Beni Zmenzer","code":"1516","wilaya":"تيزي وزو"},{"name":"Boghni","code":"1540","wilaya":"تيزي وزو"},{"name":"Boudjima","code":"1555","wilaya":"تيزي وزو"},{"name":"Bounouh","code":"1512","wilaya":"تيزي وزو"},{"name":"Bouzeguene","code":"1534","wilaya":"تيزي وزو"},{"name":"Djebel Aissa Mimoun","code":"1539","wilaya":"تيزي وزو"},{"name":"Draa Ben Khedda","code":"1547","wilaya":"تيزي وزو"},{"name":"Draa El Mizan","code":"1510","wilaya":"تيزي وزو"},{"name":"Freha","code":"1504","wilaya":"تيزي وزو"},{"name":"Frikat","code":"1514","wilaya":"تيزي وزو"},{"name":"Iboudrarene","code":"1560","wilaya":"تيزي وزو"},{"name":"Idjeur","code":"1549","wilaya":"تيزي وزو"},{"name":"Iferhounene","code":"1517","wilaya":"تيزي وزو"},{"name":"Ifigha","code":"1541","wilaya":"تيزي وزو"},{"name":"Iflissen","code":"1554","wilaya":"تيزي وزو"},{"name":"Illilten","code":"1533","wilaya":"تيزي وزو"},{"name":"Illoula Oumalou","code":"1519","wilaya":"تيزي وزو"},{"name":"Imsouhal","code":"1563","wilaya":"تيزي وزو"},{"name":"Irdjen","code":"1507","wilaya":"تيزي وزو"},{"name":"Larba Nath Irathen","code":"1521","wilaya":"تيزي وزو"},{"name":"Larbaa Nath Irathen","code":"1568","wilaya":"تيزي وزو"},{"name":"M'kira","code":"1526","wilaya":"تيزي وزو"},{"name":"Maatkas","code":"1529","wilaya":"تيزي وزو"},{"name":"Makouda","code":"1509","wilaya":"تيزي وزو"},{"name":"Mechtras","code":"1506","wilaya":"تيزي وزو"},{"name":"Mekla","code":"1550","wilaya":"تيزي وزو"},{"name":"Mizrana","code":"1562","wilaya":"تيزي وزو"},{"name":"Ouacif","code":"1548","wilaya":"تيزي وزو"},{"name":"Ouadhias","code":"1536","wilaya":"تيزي وزو"},{"name":"Ouaguenoune","code":"1524","wilaya":"تيزي وزو"},{"name":"Sidi Naamane","code":"1559","wilaya":"تيزي وزو"},{"name":"Souamaa","code":"1505","wilaya":"تيزي وزو"},{"name":"Souk El Thenine","code":"1557","wilaya":"تيزي وزو"},{"name":"Tadmait","code":"1564","wilaya":"تيزي وزو"},{"name":"Tigzirt","code":"1538","wilaya":"تيزي وزو"},{"name":"Timizart","code":"1508","wilaya":"تيزي وزو"},{"name":"Tirmitine","code":"1543","wilaya":"تيزي وزو"},{"name":"Tizi Ghenif","code":"1511","wilaya":"تيزي وزو"},{"name":"Tizi N'tleta","code":"1551","wilaya":"تيزي وزو"},{"name":"Tizi Ouzou","code":"1501","wilaya":"تيزي وزو"},{"name":"Tizi Rached","code":"1522","wilaya":"تيزي وزو"},{"name":"Yakourene","code":"1520","wilaya":"تيزي وزو"},{"name":"Yatafene","code":"1545","wilaya":"تيزي وزو"},{"name":"Zekri","code":"1523","wilaya":"تيزي وزو"},{"name":"Ain Benian","code":"1657","wilaya":"الجزائر"},{"name":"Ain Taya","code":"1641","wilaya":"الجزائر"},{"name":"Alger Centre","code":"1601","wilaya":"الجزائر"},{"name":"Bab El Oued","code":"1605","wilaya":"الجزائر"},{"name":"Bab Ezzouar","code":"1621","wilaya":"الجزائر"},{"name":"Baba Hesen","code":"1647","wilaya":"الجزائر"},{"name":"Bachedjerah","code":"1619","wilaya":"الجزائر"},{"name":"Bains Romains","code":"1624","wilaya":"الجزائر"},{"name":"Baraki","code":"1614","wilaya":"الجزائر"},{"name":"Ben Aknoun","code":"1622","wilaya":"الجزائر"},{"name":"Beni Messous","code":"1632","wilaya":"الجزائر"},{"name":"Bir Mourad Rais","code":"1609","wilaya":"الجزائر"},{"name":"Bir Touta","code":"1636","wilaya":"الجزائر"},{"name":"Birkhadem","code":"1612","wilaya":"الجزائر"},{"name":"Bologhine Ibnou Ziri","code":"1606","wilaya":"الجزائر"},{"name":"Bordj El Bahri","code":"1642","wilaya":"الجزائر"},{"name":"Bordj El Kiffan","code":"1630","wilaya":"الجزائر"},{"name":"Bourouba","code":"1616","wilaya":"الجزائر"},{"name":"Bouzareah","code":"1611","wilaya":"الجزائر"},{"name":"Casbah","code":"1607","wilaya":"الجزائر"},{"name":"Cheraga","code":"1652","wilaya":"الجزائر"},{"name":"Dar El Beida","code":"1620","wilaya":"الجزائر"},{"name":"Dely Ibrahim","code":"1623","wilaya":"الجزائر"},{"name":"Djasr Kasentina","code":"1626","wilaya":"الجزائر"},{"name":"Douira","code":"1648","wilaya":"الجزائر"},{"name":"Draria","code":"1649","wilaya":"الجزائر"},{"name":"El Achour","code":"1654","wilaya":"الجزائر"},{"name":"El Biar","code":"1610","wilaya":"الجزائر"},{"name":"El Harrach","code":"1613","wilaya":"الجزائر"},{"name":"El Madania","code":"1603","wilaya":"الجزائر"},{"name":"El Magharia","code":"1631","wilaya":"الجزائر"},{"name":"El Merssa","code":"1643","wilaya":"الجزائر"},{"name":"El Mouradia","code":"1627","wilaya":"الجزائر"},{"name":"Herraoua","code":"1639","wilaya":"الجزائر"},{"name":"Hussein Dey","code":"1617","wilaya":"الجزائر"},{"name":"Hydra","code":"1628","wilaya":"الجزائر"},{"name":"Kheraisia","code":"1656","wilaya":"الجزائر"},{"name":"Kouba","code":"1618","wilaya":"الجزائر"},{"name":"Les Eucalyptus","code":"1633","wilaya":"الجزائر"},{"name":"Maalma","code":"1646","wilaya":"الجزائر"},{"name":"Mohamed Belouzdad","code":"1604","wilaya":"الجزائر"},{"name":"Mohammadia","code":"1629","wilaya":"الجزائر"},{"name":"Oued Koriche","code":"1608","wilaya":"الجزائر"},{"name":"Oued Smar","code":"1615","wilaya":"الجزائر"},{"name":"Ouled Chebel","code":"1635","wilaya":"الجزائر"},{"name":"Ouled Fayet","code":"1651","wilaya":"الجزائر"},{"name":"Rahmania","code":"1650","wilaya":"الجزائر"},{"name":"Rais Hamidou","code":"1625","wilaya":"الجزائر"},{"name":"Reghaia","code":"1640","wilaya":"الجزائر"},{"name":"Rouiba","code":"1638","wilaya":"الجزائر"},{"name":"Sehaoula","code":"1645","wilaya":"الجزائر"},{"name":"Setaouali","code":"1653","wilaya":"الجزائر"},{"name":"Sidi M'hamed","code":"1602","wilaya":"الجزائر"},{"name":"Sidi Moussa","code":"1637","wilaya":"الجزائر"},{"name":"Souidania","code":"1655","wilaya":"الجزائر"},{"name":"Tessala El Merdja","code":"1634","wilaya":"الجزائر"},{"name":"Zeralda","code":"1644","wilaya":"الجزائر"},{"name":"Ain Chouhada","code":"1723","wilaya":"الجلفة"},{"name":"Ain El Ibel","code":"1730","wilaya":"الجلفة"},{"name":"Ain Fekka","code":"1735","wilaya":"الجلفة"},{"name":"Ain Maabed","code":"1705","wilaya":"الجلفة"},{"name":"Ain Oussera","code":"1731","wilaya":"الجلفة"},{"name":"Amourah","code":"1734","wilaya":"الجلفة"},{"name":"Benhar","code":"1732","wilaya":"الجلفة"},{"name":"Benyagoub","code":"1727","wilaya":"الجلفة"},{"name":"Birine","code":"1708","wilaya":"الجلفة"},{"name":"Bouira Lahdab","code":"1709","wilaya":"الجلفة"},{"name":"Charef","code":"1726","wilaya":"الجلفة"},{"name":"Dar Chioukh","code":"1725","wilaya":"الجلفة"},{"name":"Deldoul","code":"1729","wilaya":"الجلفة"},{"name":"Djelfa","code":"1701","wilaya":"الجلفة"},{"name":"Douis","code":"1715","wilaya":"الجلفة"},{"name":"El Guedid","code":"1703","wilaya":"الجلفة"},{"name":"El Idrissia","code":"1714","wilaya":"الجلفة"},{"name":"El Khemis","code":"1711","wilaya":"الجلفة"},{"name":"Faidh El Botma","code":"1707","wilaya":"الجلفة"},{"name":"Guernini","code":"1721","wilaya":"الجلفة"},{"name":"Guettara","code":"1718","wilaya":"الجلفة"},{"name":"Had Sahary","code":"1720","wilaya":"الجلفة"},{"name":"Hassi Bahbah","code":"1704","wilaya":"الجلفة"},{"name":"Hassi El Euch","code":"1716","wilaya":"الجلفة"},{"name":"Hassi Fedoul","code":"1733","wilaya":"الجلفة"},{"name":"M Liliha","code":"1713","wilaya":"الجلفة"},{"name":"Messaad","code":"1717","wilaya":"الجلفة"},{"name":"Moudjebara","code":"1702","wilaya":"الجلفة"},{"name":"Oum Laadham","code":"1724","wilaya":"الجلفة"},{"name":"Sed Rahal","code":"1706","wilaya":"الجلفة"},{"name":"Selmana","code":"1722","wilaya":"الجلفة"},{"name":"Sidi Baizid","code":"1712","wilaya":"الجلفة"},{"name":"Sidi Ladjel","code":"1719","wilaya":"الجلفة"},{"name":"Tadmit","code":"1736","wilaya":"الجلفة"},{"name":"Zaafrane","code":"1728","wilaya":"الجلفة"},{"name":"Zaccar","code":"1710","wilaya":"الجلفة"},{"name":"Bordj Tahar","code":"1826","wilaya":"جيجل"},{"name":"Boudria Beniyadjis","code":"1822","wilaya":"جيجل"},{"name":"Bouraoui Belhadef","code":"1816","wilaya":"جيجل"},{"name":"Boussif Ouled Askeur","code":"1819","wilaya":"جيجل"},{"name":"Chahna","code":"1808","wilaya":"جيجل"},{"name":"Chekfa","code":"1807","wilaya":"جيجل"},{"name":"Djemaa Beni Habibi","code":"1825","wilaya":"جيجل"},{"name":"Djimla","code":"1817","wilaya":"جيجل"},{"name":"El Ancer","code":"1812","wilaya":"جيجل"},{"name":"El Aouana","code":"1803","wilaya":"جيجل"},{"name":"El Kennar Nouchfi","code":"1820","wilaya":"جيجل"},{"name":"El Milia","code":"1809","wilaya":"جيجل"},{"name":"Emir Abdelkader","code":"1806","wilaya":"جيجل"},{"name":"Erraguene","code":"1802","wilaya":"جيجل"},{"name":"Ghebala","code":"1815","wilaya":"جيجل"},{"name":"Jijel","code":"1801","wilaya":"جيجل"},{"name":"Khiri Oued Adjoul","code":"1823","wilaya":"جيجل"},{"name":"Kouas","code":"1814","wilaya":"جيجل"},{"name":"Oudjana","code":"1828","wilaya":"جيجل"},{"name":"Ouled Rabah","code":"1827","wilaya":"جيجل"},{"name":"Ouled Yahia Khadrouch","code":"1821","wilaya":"جيجل"},{"name":"Selma Benziada","code":"1818","wilaya":"جيجل"},{"name":"Settara","code":"1811","wilaya":"جيجل"},{"name":"Sidi Abdelaziz","code":"1813","wilaya":"جيجل"},{"name":"Sidi Marouf","code":"1810","wilaya":"جيجل"},{"name":"Taher","code":"1805","wilaya":"جيجل"},{"name":"Texena","code":"1824","wilaya":"جيجل"},{"name":"Ziama Mansouria","code":"1804","wilaya":"جيجل"},{"name":"Ain Abessa","code":"1914","wilaya":"سطيف"},{"name":"Ain Arnat","code":"1926","wilaya":"سطيف"},{"name":"Ain Azel","code":"1940","wilaya":"سطيف"},{"name":"Ain El Kebira","code":"1902","wilaya":"سطيف"},{"name":"Ain Lahdjar","code":"1918","wilaya":"سطيف"},{"name":"Ain Legradj","code":"1913","wilaya":"سطيف"},{"name":"Ain Oulmane","code":"1928","wilaya":"سطيف"},{"name":"Ain Roua","code":"1906","wilaya":"سطيف"},{"name":"Ain Sebt","code":"1949","wilaya":"سطيف"},{"name":"Ait Naoual Mezada","code":"1951","wilaya":"سطيف"},{"name":"Ait Tizi","code":"1954","wilaya":"سطيف"},{"name":"Amoucha","code":"1927","wilaya":"سطيف"},{"name":"Babor","code":"1916","wilaya":"سطيف"},{"name":"Bazer Sakra","code":"1931","wilaya":"سطيف"},{"name":"Beidha Bordj","code":"1929","wilaya":"سطيف"},{"name":"Bellaa","code":"1925","wilaya":"سطيف"},{"name":"Beni Aziz","code":"1903","wilaya":"سطيف"},{"name":"Beni Chebana","code":"1909","wilaya":"سطيف"},{"name":"Beni Fouda","code":"1944","wilaya":"سطيف"},{"name":"Beni Mouhli","code":"1946","wilaya":"سطيف"},{"name":"Beni Ouartilane","code":"1922","wilaya":"سطيف"},{"name":"Beni Oussine","code":"1953","wilaya":"سطيف"},{"name":"Bir El Arch","code":"1908","wilaya":"سطيف"},{"name":"Bir Haddada","code":"1934","wilaya":"سطيف"},{"name":"Bouandas","code":"1930","wilaya":"سطيف"},{"name":"Bougaa","code":"1943","wilaya":"سطيف"},{"name":"Bousselam","code":"1919","wilaya":"سطيف"},{"name":"Boutaleb","code":"1905","wilaya":"سطيف"},{"name":"Dehamcha","code":"1915","wilaya":"سطيف"},{"name":"Djemila","code":"1921","wilaya":"سطيف"},{"name":"Draa Kebila","code":"1907","wilaya":"سطيف"},{"name":"El Eulma","code":"1920","wilaya":"سطيف"},{"name":"El Ouldja","code":"1959","wilaya":"سطيف"},{"name":"El Ouricia","code":"1937","wilaya":"سطيف"},{"name":"Guellal","code":"1948","wilaya":"سطيف"},{"name":"Guelta Zerka","code":"1956","wilaya":"سطيف"},{"name":"Guenzet","code":"1941","wilaya":"سطيف"},{"name":"Guidjel","code":"1917","wilaya":"سطيف"},{"name":"Hamam Soukhna","code":"1932","wilaya":"سطيف"},{"name":"Hamma","code":"1911","wilaya":"سطيف"},{"name":"Hammam Guergour","code":"1950","wilaya":"سطيف"},{"name":"Harbil","code":"1936","wilaya":"سطيف"},{"name":"Ksar El Abtal","code":"1952","wilaya":"سطيف"},{"name":"Maaouia","code":"1912","wilaya":"سطيف"},{"name":"Maouaklane","code":"1955","wilaya":"سطيف"},{"name":"Mezloug","code":"1933","wilaya":"سطيف"},{"name":"Oued El Barad","code":"1957","wilaya":"سطيف"},{"name":"Ouled Addouane","code":"1924","wilaya":"سطيف"},{"name":"Ouled Sabor","code":"1947","wilaya":"سطيف"},{"name":"Ouled Si Ahmed","code":"1904","wilaya":"سطيف"},{"name":"Ouled Tebben","code":"1910","wilaya":"سطيف"},{"name":"Rosfa","code":"1923","wilaya":"سطيف"},{"name":"Salah Bey","code":"1939","wilaya":"سطيف"},{"name":"Serdj El Ghoul","code":"1935","wilaya":"سطيف"},{"name":"Setif","code":"1901","wilaya":"سطيف"},{"name":"Tachouda","code":"1945","wilaya":"سطيف"},{"name":"Tala Ifacene","code":"1942","wilaya":"سطيف"},{"name":"Taya","code":"1958","wilaya":"سطيف"},{"name":"Tella","code":"1960","wilaya":"سطيف"},{"name":"Tizi N'bechar","code":"1938","wilaya":"سطيف"},{"name":"Ain El Hadjar","code":"2003","wilaya":"سعيدة"},{"name":"Ain Sekhouna","code":"2013","wilaya":"سعيدة"},{"name":"Ain Soltane","code":"2016","wilaya":"سعيدة"},{"name":"Doui Thabet","code":"2002","wilaya":"سعيدة"},{"name":"El Hassasna","code":"2010","wilaya":"سعيدة"},{"name":"Hounet","code":"2007","wilaya":"سعيدة"},{"name":"Maamora","code":"2011","wilaya":"سعيدة"},{"name":"Moulay Larbi","code":"2005","wilaya":"سعيدة"},{"name":"Ouled Brahim","code":"2014","wilaya":"سعيدة"},{"name":"Ouled Khaled","code":"2004","wilaya":"سعيدة"},{"name":"Saida","code":"2001","wilaya":"سعيدة"},{"name":"Sidi Ahmed","code":"2012","wilaya":"سعيدة"},{"name":"Sidi Amar","code":"2008","wilaya":"سعيدة"},{"name":"Sidi Boubekeur","code":"2009","wilaya":"سعيدة"},{"name":"Tircine","code":"2015","wilaya":"سعيدة"},{"name":"Youb","code":"2006","wilaya":"سعيدة"},{"name":"Ain Bouziane","code":"2122","wilaya":"سكيكدة"},{"name":"Ain Charchar","code":"2106","wilaya":"سكيكدة"},{"name":"Ain Kechera","code":"2127","wilaya":"سكيكدة"},{"name":"Ain Zouit","code":"2102","wilaya":"سكيكدة"},{"name":"Azzaba","code":"2104","wilaya":"سكيكدة"},{"name":"Bekkouche Lakhdar","code":"2107","wilaya":"سكيكدة"},{"name":"Ben Azzouz","code":"2108","wilaya":"سكيكدة"},{"name":"Beni Bechir","code":"2124","wilaya":"سكيكدة"},{"name":"Beni Oulbane","code":"2121","wilaya":"سكيكدة"},{"name":"Beni Zid","code":"2111","wilaya":"سكيكدة"},{"name":"Bin El Ouiden","code":"2129","wilaya":"سكيكدة"},{"name":"Bouchetata","code":"2134","wilaya":"سكيكدة"},{"name":"Cheraia","code":"2131","wilaya":"سكيكدة"},{"name":"Collo","code":"2110","wilaya":"سكيكدة"},{"name":"Djendel Saadi Mohamed","code":"2105","wilaya":"سكيكدة"},{"name":"El Arrouch","code":"2116","wilaya":"سكيكدة"},{"name":"El Ghedir","code":"2133","wilaya":"سكيكدة"},{"name":"El Hadaiek","code":"2103","wilaya":"سكيكدة"},{"name":"El Marsa","code":"2138","wilaya":"سكيكدة"},{"name":"Emjez Edchich","code":"2120","wilaya":"سكيكدة"},{"name":"Es Sebt","code":"2109","wilaya":"سكيكدة"},{"name":"Filfila","code":"2130","wilaya":"سكيكدة"},{"name":"Hamadi Krouma","code":"2137","wilaya":"سكيكدة"},{"name":"Kanoua","code":"2132","wilaya":"سكيكدة"},{"name":"Kerkera","code":"2112","wilaya":"سكيكدة"},{"name":"Khenag Mayoum","code":"2136","wilaya":"سكيكدة"},{"name":"Oued Zhour","code":"2114","wilaya":"سكيكدة"},{"name":"Ouldja Boulbalout","code":"2135","wilaya":"سكيكدة"},{"name":"Ouled Attia","code":"2113","wilaya":"سكيكدة"},{"name":"Ouled Habbeba","code":"2118","wilaya":"سكيكدة"},{"name":"Oum Toub","code":"2128","wilaya":"سكيكدة"},{"name":"Ramdane Djamel","code":"2123","wilaya":"سكيكدة"},{"name":"Salah Bouchaour","code":"2125","wilaya":"سكيكدة"},{"name":"Sidi Mezghiche","code":"2119","wilaya":"سكيكدة"},{"name":"Skikda","code":"2101","wilaya":"سكيكدة"},{"name":"Tamalous","code":"2126","wilaya":"سكيكدة"},{"name":"Zerdezas","code":"2117","wilaya":"سكيكدة"},{"name":"Zitouna","code":"2115","wilaya":"سكيكدة"},{"name":"Ain Adden","code":"2230","wilaya":"سيدي بلعباس"},{"name":"Ain El Berd","code":"2228","wilaya":"سيدي بلعباس"},{"name":"Ain Kada","code":"2225","wilaya":"سيدي بلعباس"},{"name":"Ain Thrid","code":"2215","wilaya":"سيدي بلعباس"},{"name":"Ain Tindamine","code":"2224","wilaya":"سيدي بلعباس"},{"name":"Amarnas","code":"2212","wilaya":"سيدي بلعباس"},{"name":"Badredine El Mokrani","code":"2209","wilaya":"سيدي بلعباس"},{"name":"Belarbi","code":"2242","wilaya":"سيدي بلعباس"},{"name":"Ben Badis","code":"2245","wilaya":"سيدي بلعباس"},{"name":"Benachiba Chelia","code":"2251","wilaya":"سيدي بلعباس"},{"name":"Bir El Hammam","code":"2248","wilaya":"سيدي بلعباس"},{"name":"Boudjebaa El Bordj","code":"2238","wilaya":"سيدي بلعباس"},{"name":"Boukhanafis","code":"2207","wilaya":"سيدي بلعباس"},{"name":"Chetouane Belaila","code":"2247","wilaya":"سيدي بلعباس"},{"name":"Dhaya","code":"2232","wilaya":"سيدي بلعباس"},{"name":"El Hacaiba","code":"2219","wilaya":"سيدي بلعباس"},{"name":"Hassi Dahou","code":"2252","wilaya":"سيدي بلعباس"},{"name":"Hassi Zahana","code":"2220","wilaya":"سيدي بلعباس"},{"name":"Lamtar","code":"2234","wilaya":"سيدي بلعباس"},{"name":"M'cid","code":"2226","wilaya":"سيدي بلعباس"},{"name":"Makedra","code":"2216","wilaya":"سيدي بلعباس"},{"name":"Marhoum","code":"2210","wilaya":"سيدي بلعباس"},{"name":"Merine","code":"2222","wilaya":"سيدي بلعباس"},{"name":"Mezaourou","code":"2206","wilaya":"سيدي بلعباس"},{"name":"Mostefa Ben Brahim","code":"2204","wilaya":"سيدي بلعباس"},{"name":"Moulay Slissen","code":"2218","wilaya":"سيدي بلعباس"},{"name":"Oued Sebaa","code":"2237","wilaya":"سيدي بلعباس"},{"name":"Oued Sefioun","code":"2243","wilaya":"سيدي بلعباس"},{"name":"Oued Taourira","code":"2231","wilaya":"سيدي بلعباس"},{"name":"Ras El Ma","code":"2223","wilaya":"سيدي بلعباس"},{"name":"Redjem Demouche","code":"2250","wilaya":"سيدي بلعباس"},{"name":"Sehala Thaoura","code":"2239","wilaya":"سيدي بلعباس"},{"name":"Sfissef","code":"2229","wilaya":"سيدي بلعباس"},{"name":"Sidi Ali Benyoub","code":"2246","wilaya":"سيدي بلعباس"},{"name":"Sidi Ali Boussidi","code":"2208","wilaya":"سيدي بلعباس"},{"name":"Sidi Bel Abbes","code":"2201","wilaya":"سيدي بلعباس"},{"name":"Sidi Brahim","code":"2203","wilaya":"سيدي بلعباس"},{"name":"Sidi Chaib","code":"2235","wilaya":"سيدي بلعباس"},{"name":"Sidi Dahou Zairs","code":"2236","wilaya":"سيدي بلعباس"},{"name":"Sidi Hamadouche","code":"2241","wilaya":"سيدي بلعباس"},{"name":"Sidi Khaled","code":"2227","wilaya":"سيدي بلعباس"},{"name":"Sidi Lahcene","code":"2214","wilaya":"سيدي بلعباس"},{"name":"Sidi Yacoub","code":"2240","wilaya":"سيدي بلعباس"},{"name":"Tabia","code":"2221","wilaya":"سيدي بلعباس"},{"name":"Tafissour","code":"2211","wilaya":"سيدي بلعباس"},{"name":"Taoudmout","code":"2249","wilaya":"سيدي بلعباس"},{"name":"Teghalimet","code":"2244","wilaya":"سيدي بلعباس"},{"name":"Telagh","code":"2205","wilaya":"سيدي بلعباس"},{"name":"Tenira","code":"2217","wilaya":"سيدي بلعباس"},{"name":"Tessala","code":"2202","wilaya":"سيدي بلعباس"},{"name":"Tilmouni","code":"2213","wilaya":"سيدي بلعباس"},{"name":"Zerouala","code":"2233","wilaya":"سيدي بلعباس"},{"name":"Ain Berda","code":"2309","wilaya":"عنابة"},{"name":"Annaba","code":"2301","wilaya":"عنابة"},{"name":"Berrahel","code":"2302","wilaya":"عنابة"},{"name":"Chetaibi","code":"2310","wilaya":"عنابة"},{"name":"Cheurfa","code":"2307","wilaya":"عنابة"},{"name":"El Bouni","code":"2305","wilaya":"عنابة"},{"name":"El Hadjar","code":"2303","wilaya":"عنابة"},{"name":"Eulma","code":"2304","wilaya":"عنابة"},{"name":"Oued El Aneb","code":"2306","wilaya":"عنابة"},{"name":"Seraidi","code":"2308","wilaya":"عنابة"},{"name":"Sidi Amar","code":"2311","wilaya":"عنابة"},{"name":"Treat","code":"2312","wilaya":"عنابة"},{"name":"Ain Ben Beida","code":"2414","wilaya":"قالمة"},{"name":"Ain Hessania","code":"2427","wilaya":"قالمة"},{"name":"Ain Larbi","code":"2423","wilaya":"قالمة"},{"name":"Ain Makhlouf","code":"2413","wilaya":"قالمة"},{"name":"Ain Reggada","code":"2432","wilaya":"قالمة"},{"name":"Belkheir","code":"2410","wilaya":"قالمة"},{"name":"Ben Djarah","code":"2411","wilaya":"قالمة"},{"name":"Beni Mezline","code":"2416","wilaya":"قالمة"},{"name":"Bordj Sabat","code":"2421","wilaya":"قالمة"},{"name":"Bou Hachana","code":"2417","wilaya":"قالمة"},{"name":"Bou Hamdane","code":"2412","wilaya":"قالمة"},{"name":"Bouati Mahmoud","code":"2403","wilaya":"قالمة"},{"name":"Bouchegouf","code":"2425","wilaya":"قالمة"},{"name":"Bouhamra Ahmed","code":"2431","wilaya":"قالمة"},{"name":"Dahouara","code":"2409","wilaya":"قالمة"},{"name":"Djeballah Khemissi","code":"2434","wilaya":"قالمة"},{"name":"El Fedjoudj","code":"2420","wilaya":"قالمة"},{"name":"Guelaat Bou Sbaa","code":"2418","wilaya":"قالمة"},{"name":"Guelma","code":"2401","wilaya":"قالمة"},{"name":"Hamam Debagh","code":"2419","wilaya":"قالمة"},{"name":"Hammam N'bail","code":"2422","wilaya":"قالمة"},{"name":"Heliopolis","code":"2426","wilaya":"قالمة"},{"name":"Khezara","code":"2415","wilaya":"قالمة"},{"name":"Medjez Amar","code":"2424","wilaya":"قالمة"},{"name":"Medjez Sfa","code":"2430","wilaya":"قالمة"},{"name":"Nechmaya","code":"2402","wilaya":"قالمة"},{"name":"Oued Cheham","code":"2433","wilaya":"قالمة"},{"name":"Oued Fragha","code":"2406","wilaya":"قالمة"},{"name":"Oued Zenati","code":"2404","wilaya":"قالمة"},{"name":"Ras El Agba","code":"2408","wilaya":"قالمة"},{"name":"Roknia","code":"2428","wilaya":"قالمة"},{"name":"Sellaoua Announa","code":"2429","wilaya":"قالمة"},{"name":"Sidi Sandel","code":"2407","wilaya":"قالمة"},{"name":"Tamlouka","code":"2405","wilaya":"قالمة"},{"name":"Ain Abid","code":"2507","wilaya":"قسنطينة"},{"name":"Ain Smara","code":"2510","wilaya":"قسنطينة"},{"name":"Ben Badis","code":"2503","wilaya":"قسنطينة"},{"name":"Beni Hamidene","code":"2508","wilaya":"قسنطينة"},{"name":"Constantine","code":"2501","wilaya":"قسنطينة"},{"name":"Didouche Mourad","code":"2505","wilaya":"قسنطينة"},{"name":"El Khroub","code":"2506","wilaya":"قسنطينة"},{"name":"Hamma Bouziane","code":"2502","wilaya":"قسنطينة"},{"name":"Ibn Ziad","code":"2512","wilaya":"قسنطينة"},{"name":"Messaoud Boujeriou","code":"2511","wilaya":"قسنطينة"},{"name":"Ouled Rahmouni","code":"2509","wilaya":"قسنطينة"},{"name":"Zighoud Youcef","code":"2504","wilaya":"قسنطينة"},{"name":"Ain Boucif","code":"2604","wilaya":"المدية"},{"name":"Ain Ouksir","code":"2641","wilaya":"المدية"},{"name":"Aissaouia","code":"2605","wilaya":"المدية"},{"name":"Aziz","code":"2632","wilaya":"المدية"},{"name":"Baata","code":"2624","wilaya":"المدية"},{"name":"Ben Chicao","code":"2630","wilaya":"المدية"},{"name":"Beni Slimane","code":"2646","wilaya":"المدية"},{"name":"Berrouaghia","code":"2647","wilaya":"المدية"},{"name":"Bir Ben Laabed","code":"2656","wilaya":"المدية"},{"name":"Boghar","code":"2625","wilaya":"المدية"},{"name":"Bouaiche","code":"2610","wilaya":"المدية"},{"name":"Bouaichoune","code":"2659","wilaya":"المدية"},{"name":"Bouchrahil","code":"2621","wilaya":"المدية"},{"name":"Boughzoul","code":"2651","wilaya":"المدية"},{"name":"Bouskene","code":"2619","wilaya":"المدية"},{"name":"Chabounia","code":"2638","wilaya":"المدية"},{"name":"Chelalet El Adhaoura","code":"2618","wilaya":"المدية"},{"name":"Cheniguel","code":"2640","wilaya":"المدية"},{"name":"Damiat","code":"2613","wilaya":"المدية"},{"name":"Derrag","code":"2608","wilaya":"المدية"},{"name":"Deux Bassins","code":"2653","wilaya":"المدية"},{"name":"Djouab","code":"2637","wilaya":"المدية"},{"name":"Draa Essamar","code":"2654","wilaya":"المدية"},{"name":"El Azizia","code":"2636","wilaya":"المدية"},{"name":"El Guelbelkebir","code":"2609","wilaya":"المدية"},{"name":"El Hamdania","code":"2616","wilaya":"المدية"},{"name":"El Omaria","code":"2607","wilaya":"المدية"},{"name":"El Ouinet","code":"2657","wilaya":"المدية"},{"name":"Hannacha","code":"2660","wilaya":"المدية"},{"name":"Kef Lakhdar","code":"2617","wilaya":"المدية"},{"name":"Khams Djouamaa","code":"2663","wilaya":"المدية"},{"name":"Ksar El Boukhari","code":"2635","wilaya":"المدية"},{"name":"Maghraoua","code":"2639","wilaya":"المدية"},{"name":"Medea","code":"2601","wilaya":"المدية"},{"name":"Medjebar","code":"2662","wilaya":"المدية"},{"name":"Meftaha","code":"2649","wilaya":"المدية"},{"name":"Mezerana","code":"2611","wilaya":"المدية"},{"name":"Mihoub","code":"2650","wilaya":"المدية"},{"name":"Ouamri","code":"2643","wilaya":"المدية"},{"name":"Oued Harbil","code":"2629","wilaya":"المدية"},{"name":"Ouled Antar","code":"2658","wilaya":"المدية"},{"name":"Ouled Bouachra","code":"2627","wilaya":"المدية"},{"name":"Ouled Brahim","code":"2612","wilaya":"المدية"},{"name":"Ouled Deid","code":"2606","wilaya":"المدية"},{"name":"Ouled Hellal","code":"2622","wilaya":"المدية"},{"name":"Ouled Maaref","code":"2603","wilaya":"المدية"},{"name":"Oum El Djellil","code":"2642","wilaya":"المدية"},{"name":"Ouzera","code":"2602","wilaya":"المدية"},{"name":"Rebaia","code":"2620","wilaya":"المدية"},{"name":"Saneg","code":"2664","wilaya":"المدية"},{"name":"Sedraya","code":"2661","wilaya":"المدية"},{"name":"Seghouane","code":"2648","wilaya":"المدية"},{"name":"Si Mahdjoub","code":"2644","wilaya":"المدية"},{"name":"Sidi Demed","code":"2631","wilaya":"المدية"},{"name":"Sidi Naamane","code":"2626","wilaya":"المدية"},{"name":"Sidi Rabie","code":"2655","wilaya":"المدية"},{"name":"Sidi Zahar","code":"2628","wilaya":"المدية"},{"name":"Sidi Ziane","code":"2614","wilaya":"المدية"},{"name":"Souagui","code":"2633","wilaya":"المدية"},{"name":"Tablat","code":"2652","wilaya":"المدية"},{"name":"Tafraout","code":"2623","wilaya":"المدية"},{"name":"Tamesguida","code":"2615","wilaya":"المدية"},{"name":"Tletat Ed Douair","code":"2645","wilaya":"المدية"},{"name":"Zoubiria","code":"2634","wilaya":"المدية"},{"name":"Achaacha","code":"2717","wilaya":"مستغانم"},{"name":"Ain Boudinar","code":"2728","wilaya":"مستغانم"},{"name":"Ain Nouissy","code":"2705","wilaya":"مستغانم"},{"name":"Ain Sidi Cherif","code":"2721","wilaya":"مستغانم"},{"name":"Ain Tedles","code":"2707","wilaya":"مستغانم"},{"name":"Benabdelmalek Ramdane","code":"2713","wilaya":"مستغانم"},{"name":"Bouguirat","code":"2719","wilaya":"مستغانم"},{"name":"Fornaka","code":"2703","wilaya":"مستغانم"},{"name":"Hadjadj","code":"2714","wilaya":"مستغانم"},{"name":"Hassi Mameche","code":"2706","wilaya":"مستغانم"},{"name":"Hassiane","code":"2732","wilaya":"مستغانم"},{"name":"Khadra","code":"2718","wilaya":"مستغانم"},{"name":"Kheir Eddine","code":"2711","wilaya":"مستغانم"},{"name":"Mansourah","code":"2723","wilaya":"مستغانم"},{"name":"Mazagran","code":"2727","wilaya":"مستغانم"},{"name":"Mesra","code":"2722","wilaya":"مستغانم"},{"name":"Mostaganem","code":"2701","wilaya":"مستغانم"},{"name":"Nekmaria","code":"2715","wilaya":"مستغانم"},{"name":"Oued El Kheir","code":"2709","wilaya":"مستغانم"},{"name":"Ouled Boughalem","code":"2725","wilaya":"مستغانم"},{"name":"Ouled Maalah","code":"2726","wilaya":"مستغانم"},{"name":"Safsaf","code":"2730","wilaya":"مستغانم"},{"name":"Sayada","code":"2702","wilaya":"مستغانم"},{"name":"Sidi Ali","code":"2712","wilaya":"مستغانم"},{"name":"Sidi Belaattar","code":"2710","wilaya":"مستغانم"},{"name":"Sidi Lakhdar","code":"2716","wilaya":"مستغانم"},{"name":"Sirat","code":"2720","wilaya":"مستغانم"},{"name":"Souaflia","code":"2724","wilaya":"مستغانم"},{"name":"Sour","code":"2708","wilaya":"مستغانم"},{"name":"Stidia","code":"2704","wilaya":"مستغانم"},{"name":"Tazgait","code":"2729","wilaya":"مستغانم"},{"name":"Touahria","code":"2731","wilaya":"مستغانم"},{"name":"Ain El Hadjel","code":"2817","wilaya":"المسيلة"},{"name":"Ain El Melh","code":"2841","wilaya":"المسيلة"},{"name":"Ain Fares","code":"2837","wilaya":"المسيلة"},{"name":"Ain Khadra","code":"2813","wilaya":"المسيلة"},{"name":"Ain Rich","code":"2844","wilaya":"المسيلة"},{"name":"Belaiba","code":"2815","wilaya":"المسيلة"},{"name":"Ben Srour","code":"2824","wilaya":"المسيلة"},{"name":"Beni Ilmane","code":"2845","wilaya":"المسيلة"},{"name":"Benzouh","code":"2835","wilaya":"المسيلة"},{"name":"Berhoum","code":"2812","wilaya":"المسيلة"},{"name":"Bir Foda","code":"2836","wilaya":"المسيلة"},{"name":"Bou Saada","code":"2820","wilaya":"المسيلة"},{"name":"Bouti Sayeh","code":"2831","wilaya":"المسيلة"},{"name":"Chellal","code":"2809","wilaya":"المسيلة"},{"name":"Dehahna","code":"2830","wilaya":"المسيلة"},{"name":"Djebel Messaad","code":"2847","wilaya":"المسيلة"},{"name":"El Hamel","code":"2827","wilaya":"المسيلة"},{"name":"El Houamed","code":"2826","wilaya":"المسيلة"},{"name":"Hammam Dalaa","code":"2803","wilaya":"المسيلة"},{"name":"Khettouti Sed El Jir","code":"2832","wilaya":"المسيلة"},{"name":"Khoubana","code":"2807","wilaya":"المسيلة"},{"name":"M'cif","code":"2808","wilaya":"المسيلة"},{"name":"M'sila","code":"2801","wilaya":"المسيلة"},{"name":"M'tarfa","code":"2806","wilaya":"المسيلة"},{"name":"Maadid","code":"2802","wilaya":"المسيلة"},{"name":"Maarif","code":"2829","wilaya":"المسيلة"},{"name":"Magra","code":"2811","wilaya":"المسيلة"},{"name":"Medjedel","code":"2842","wilaya":"المسيلة"},{"name":"Menaa","code":"2839","wilaya":"المسيلة"},{"name":"Mohamed Boudiaf","code":"2834","wilaya":"المسيلة"},{"name":"Ouanougha","code":"2819","wilaya":"المسيلة"},{"name":"Ouled Addi Guebala","code":"2814","wilaya":"المسيلة"},{"name":"Ouled Derradj","code":"2804","wilaya":"المسيلة"},{"name":"Ouled Madhi","code":"2810","wilaya":"المسيلة"},{"name":"Ouled Mansour","code":"2828","wilaya":"المسيلة"},{"name":"Ouled Sidi Brahim","code":"2821","wilaya":"المسيلة"},{"name":"Ouled Slimane","code":"2825","wilaya":"المسيلة"},{"name":"Oulteme","code":"2846","wilaya":"المسيلة"},{"name":"Sidi Aissa","code":"2816","wilaya":"المسيلة"},{"name":"Sidi Ameur","code":"2822","wilaya":"المسيلة"},{"name":"Sidi Hadjeres","code":"2818","wilaya":"المسيلة"},{"name":"Sidi M'hamed","code":"2838","wilaya":"المسيلة"},{"name":"Slim","code":"2843","wilaya":"المسيلة"},{"name":"Souamaa","code":"2840","wilaya":"المسيلة"},{"name":"Tamsa","code":"2823","wilaya":"المسيلة"},{"name":"Tarmount","code":"2805","wilaya":"المسيلة"},{"name":"Zarzour","code":"2833","wilaya":"المسيلة"},{"name":"Ain Fares","code":"2924","wilaya":"معسكر"},{"name":"Ain Fekan","code":"2918","wilaya":"معسكر"},{"name":"Ain Ferah","code":"2911","wilaya":"معسكر"},{"name":"Ain Frass","code":"2925","wilaya":"معسكر"},{"name":"Alaimia","code":"2928","wilaya":"معسكر"},{"name":"Aouf","code":"2923","wilaya":"معسكر"},{"name":"Benian","code":"2919","wilaya":"معسكر"},{"name":"Bou Henni","code":"2937","wilaya":"معسكر"},{"name":"Bouhanifia","code":"2902","wilaya":"معسكر"},{"name":"Chorfa","code":"2943","wilaya":"معسكر"},{"name":"El Bordj","code":"2917","wilaya":"معسكر"},{"name":"El Gaada","code":"2929","wilaya":"معسكر"},{"name":"El Ghomri","code":"2934","wilaya":"معسكر"},{"name":"El Gueitena","code":"2938","wilaya":"معسكر"},{"name":"El Hachem","code":"2907","wilaya":"معسكر"},{"name":"El Keurt","code":"2940","wilaya":"معسكر"},{"name":"El Mamounia","code":"2939","wilaya":"معسكر"},{"name":"El Menaouer","code":"2921","wilaya":"معسكر"},{"name":"Ferraguig","code":"2933","wilaya":"معسكر"},{"name":"Froha","code":"2913","wilaya":"معسكر"},{"name":"Gharrous","code":"2941","wilaya":"معسكر"},{"name":"Ghriss","code":"2912","wilaya":"معسكر"},{"name":"Guerdjoum","code":"2942","wilaya":"معسكر"},{"name":"Hacine","code":"2904","wilaya":"معسكر"},{"name":"Khalouia","code":"2920","wilaya":"معسكر"},{"name":"Makhda","code":"2915","wilaya":"معسكر"},{"name":"Maoussa","code":"2905","wilaya":"معسكر"},{"name":"Mascara","code":"2901","wilaya":"معسكر"},{"name":"Matemore","code":"2914","wilaya":"معسكر"},{"name":"Mocta Douz","code":"2936","wilaya":"معسكر"},{"name":"Mohammadia","code":"2931","wilaya":"معسكر"},{"name":"Nesmot","code":"2945","wilaya":"معسكر"},{"name":"Oggaz","code":"2927","wilaya":"معسكر"},{"name":"Oued El Abtal","code":"2910","wilaya":"معسكر"},{"name":"Oued Taria","code":"2922","wilaya":"معسكر"},{"name":"Ras El Ain Amirouche","code":"2944","wilaya":"معسكر"},{"name":"Sedjerara","code":"2935","wilaya":"معسكر"},{"name":"Sehailia","code":"2947","wilaya":"معسكر"},{"name":"Sidi Abdeldjebar","code":"2946","wilaya":"معسكر"},{"name":"Sidi Abdelmoumene","code":"2932","wilaya":"معسكر"},{"name":"Sidi Boussaid","code":"2916","wilaya":"معسكر"},{"name":"Sidi Kada","code":"2908","wilaya":"معسكر"},{"name":"Sig","code":"2926","wilaya":"معسكر"},{"name":"Tighennif","code":"2906","wilaya":"معسكر"},{"name":"Tizi","code":"2903","wilaya":"معسكر"},{"name":"Zahana","code":"2930","wilaya":"معسكر"},{"name":"Zelamta","code":"2909","wilaya":"معسكر"},{"name":"Ain Beida","code":"3002","wilaya":"ورقلة"},{"name":"El Borma","code":"3021","wilaya":"ورقلة"},{"name":"Hassi Ben Abdellah","code":"3012","wilaya":"ورقلة"},{"name":"Hassi Messaoud","code":"3004","wilaya":"ورقلة"},{"name":"N'goussa","code":"3003","wilaya":"ورقلة"},{"name":"Ouargla","code":"3001","wilaya":"ورقلة"},{"name":"Rouissat","code":"3005","wilaya":"ورقلة"},{"name":"Sidi Khouiled","code":"3011","wilaya":"ورقلة"},{"name":"Ain Biya","code":"3126","wilaya":"وهران"},{"name":"Ain Kerma","code":"3125","wilaya":"وهران"},{"name":"Ain Turk","code":"3109","wilaya":"وهران"},{"name":"Arzew","code":"3106","wilaya":"وهران"},{"name":"Ben Freha","code":"3120","wilaya":"وهران"},{"name":"Bethioua","code":"3107","wilaya":"وهران"},{"name":"Bir El Djir","code":"3103","wilaya":"وهران"},{"name":"Boufatis","code":"3114","wilaya":"وهران"},{"name":"Bousfer","code":"3116","wilaya":"وهران"},{"name":"Boutlelis","code":"3124","wilaya":"وهران"},{"name":"El Ancar","code":"3110","wilaya":"وهران"},{"name":"El Braya","code":"3118","wilaya":"وهران"},{"name":"El Kerma","code":"3117","wilaya":"وهران"},{"name":"Es Senia","code":"3105","wilaya":"وهران"},{"name":"Gdyel","code":"3102","wilaya":"وهران"},{"name":"Hassi Ben Okba","code":"3119","wilaya":"وهران"},{"name":"Hassi Bounif","code":"3104","wilaya":"وهران"},{"name":"Hassi Mefsoukh","code":"3121","wilaya":"وهران"},{"name":"Marsat El Hadjadj","code":"3108","wilaya":"وهران"},{"name":"Mers El Kebir","code":"3115","wilaya":"وهران"},{"name":"Messerghin","code":"3123","wilaya":"وهران"},{"name":"Oran","code":"3101","wilaya":"وهران"},{"name":"Oued Tlelat","code":"3111","wilaya":"وهران"},{"name":"Sidi Ben Yebka","code":"3122","wilaya":"وهران"},{"name":"Sidi Chami","code":"3113","wilaya":"وهران"},{"name":"Tafraoui","code":"3112","wilaya":"وهران"},{"name":"Ain El Orak","code":"3208","wilaya":"البيض"},{"name":"Arbaouat","code":"3209","wilaya":"البيض"},{"name":"Boualem","code":"3206","wilaya":"البيض"},{"name":"Bougtoub","code":"3210","wilaya":"البيض"},{"name":"Boussemghoun","code":"3213","wilaya":"البيض"},{"name":"Brezina","code":"3204","wilaya":"البيض"},{"name":"Cheguig","code":"3217","wilaya":"البيض"},{"name":"Chellala","code":"3214","wilaya":"البيض"},{"name":"El Bayadh","code":"3201","wilaya":"البيض"},{"name":"El Biodh Sidi Cheikh","code":"3207","wilaya":"البيض"},{"name":"El Bnoud","code":"3216","wilaya":"البيض"},{"name":"El Kheither","code":"3211","wilaya":"البيض"},{"name":"El Mehara","code":"3219","wilaya":"البيض"},{"name":"Ghassoul","code":"3205","wilaya":"البيض"},{"name":"Kef El Ahmar","code":"3212","wilaya":"البيض"},{"name":"Krakda","code":"3215","wilaya":"البيض"},{"name":"Rogassa","code":"3202","wilaya":"البيض"},{"name":"Sidi Ameur","code":"3218","wilaya":"البيض"},{"name":"Sidi Slimane","code":"3221","wilaya":"البيض"},{"name":"Sidi Tifour","code":"3222","wilaya":"البيض"},{"name":"Stitten","code":"3203","wilaya":"البيض"},{"name":"Tousmouline","code":"3220","wilaya":"البيض"},{"name":"Bordj Omar Driss","code":"3304","wilaya":"إليزي"},{"name":"Debdeb","code":"3303","wilaya":"إليزي"},{"name":"Illizi","code":"3301","wilaya":"إليزي"},{"name":"In Amenas","code":"3306","wilaya":"إليزي"},{"name":"Ain Taghrout","code":"3408","wilaya":"برج بوعريريج"},{"name":"Ain Tesra","code":"3430","wilaya":"برج بوعريريج"},{"name":"Belimour","code":"3412","wilaya":"برج بوعريريج"},{"name":"Ben Daoud","code":"3406","wilaya":"برج بوعريريج"},{"name":"Bir Kasdali","code":"3431","wilaya":"برج بوعريريج"},{"name":"Bordj Bou Arreridj","code":"3401","wilaya":"برج بوعريريج"},{"name":"Bordj Ghdir","code":"3409","wilaya":"برج بوعريريج"},{"name":"Bordj Zemora","code":"3403","wilaya":"برج بوعريريج"},{"name":"Colla","code":"3425","wilaya":"برج بوعريريج"},{"name":"Djaafra","code":"3415","wilaya":"برج بوعريريج"},{"name":"El Ach","code":"3427","wilaya":"برج بوعريريج"},{"name":"El Achir","code":"3407","wilaya":"برج بوعريريج"},{"name":"El Anseur","code":"3428","wilaya":"برج بوعريريج"},{"name":"El Hamadia","code":"3411","wilaya":"برج بوعريريج"},{"name":"El M'hir","code":"3405","wilaya":"برج بوعريريج"},{"name":"El Main","code":"3416","wilaya":"برج بوعريريج"},{"name":"Ghilassa","code":"3432","wilaya":"برج بوعريريج"},{"name":"Haraza","code":"3434","wilaya":"برج بوعريريج"},{"name":"Hasnaoua","code":"3419","wilaya":"برج بوعريريج"},{"name":"Khelil","code":"3420","wilaya":"برج بوعريريج"},{"name":"Ksour","code":"3422","wilaya":"برج بوعريريج"},{"name":"Mansoura","code":"3404","wilaya":"برج بوعريريج"},{"name":"Medjana","code":"3413","wilaya":"برج بوعريريج"},{"name":"Ouled Brahem","code":"3417","wilaya":"برج بوعريريج"},{"name":"Ouled Dahmane","code":"3418","wilaya":"برج بوعريريج"},{"name":"Ouled Sidi Brahim","code":"3423","wilaya":"برج بوعريريج"},{"name":"Rabta","code":"3433","wilaya":"برج بوعريريج"},{"name":"Ras El Oued","code":"3402","wilaya":"برج بوعريريج"},{"name":"Sidi Embarek","code":"3410","wilaya":"برج بوعريريج"},{"name":"Tafreg","code":"3424","wilaya":"برج بوعريريج"},{"name":"Taglait","code":"3421","wilaya":"برج بوعريريج"},{"name":"Teniet En Nasr","code":"3414","wilaya":"برج بوعريريج"},{"name":"Tesmart","code":"3429","wilaya":"برج بوعريريج"},{"name":"Tixter","code":"3426","wilaya":"برج بوعريريج"},{"name":"Afir","code":"3503","wilaya":"بومرداس"},{"name":"Ammal","code":"3524","wilaya":"بومرداس"},{"name":"Baghlia","code":"3505","wilaya":"بومرداس"},{"name":"Ben Choud","code":"3522","wilaya":"بومرداس"},{"name":"Beni Amrane","code":"3525","wilaya":"بومرداس"},{"name":"Bordj Menaiel","code":"3504","wilaya":"بومرداس"},{"name":"Boudouaou","code":"3502","wilaya":"بومرداس"},{"name":"Boudouaou El Bahri","code":"3527","wilaya":"بومرداس"},{"name":"Boumerdes","code":"3501","wilaya":"بومرداس"},{"name":"Bouzegza Keddara","code":"3519","wilaya":"بومرداس"},{"name":"Chabet El Ameur","code":"3513","wilaya":"بومرداس"},{"name":"Corso","code":"3516","wilaya":"بومرداس"},{"name":"Dellys","code":"3523","wilaya":"بومرداس"},{"name":"Djinet","code":"3508","wilaya":"بومرداس"},{"name":"El Kharrouba","code":"3532","wilaya":"بومرداس"},{"name":"Hammedi","code":"3530","wilaya":"بومرداس"},{"name":"Isser","code":"3509","wilaya":"بومرداس"},{"name":"Khemis El Khechna","code":"3531","wilaya":"بومرداس"},{"name":"Larbatache","code":"3518","wilaya":"بومرداس"},{"name":"Leghata","code":"3529","wilaya":"بومرداس"},{"name":"Naciria","code":"3507","wilaya":"بومرداس"},{"name":"Ouled Aissa","code":"3521","wilaya":"بومرداس"},{"name":"Ouled Hedadj","code":"3528","wilaya":"بومرداس"},{"name":"Ouled Moussa","code":"3517","wilaya":"بومرداس"},{"name":"Si Mustapha","code":"3511","wilaya":"بومرداس"},{"name":"Sidi Daoud","code":"3506","wilaya":"بومرداس"},{"name":"Souk El Haad","code":"3526","wilaya":"بومرداس"},{"name":"Taourga","code":"3520","wilaya":"بومرداس"},{"name":"Thenia","code":"3514","wilaya":"بومرداس"},{"name":"Tidjelabine","code":"3512","wilaya":"بومرداس"},{"name":"Timezrit","code":"3515","wilaya":"بومرداس"},{"name":"Zemmouri","code":"3510","wilaya":"بومرداس"},{"name":"Ain El Assel","code":"3606","wilaya":"الطارف"},{"name":"Ain Kerma","code":"3621","wilaya":"الطارف"},{"name":"Asfour","code":"3617","wilaya":"الطارف"},{"name":"Ben M Hidi","code":"3603","wilaya":"الطارف"},{"name":"Berrihane","code":"3610","wilaya":"الطارف"},{"name":"Besbes","code":"3616","wilaya":"الطارف"},{"name":"Bougous","code":"3604","wilaya":"الطارف"},{"name":"Bouhadjar","code":"3602","wilaya":"الطارف"},{"name":"Bouteldja","code":"3608","wilaya":"الطارف"},{"name":"Chebaita Mokhtar","code":"3615","wilaya":"الطارف"},{"name":"Chefia","code":"3612","wilaya":"الطارف"},{"name":"Chihani","code":"3614","wilaya":"الطارف"},{"name":"Drean","code":"3613","wilaya":"الطارف"},{"name":"Echatt","code":"3618","wilaya":"الطارف"},{"name":"El Aioun","code":"3607","wilaya":"الطارف"},{"name":"El Kala","code":"3605","wilaya":"الطارف"},{"name":"El Tarf","code":"3601","wilaya":"الطارف"},{"name":"Hammam Beni Salah","code":"3623","wilaya":"الطارف"},{"name":"Lac Des Oiseaux","code":"3611","wilaya":"الطارف"},{"name":"Oued Zitoun","code":"3622","wilaya":"الطارف"},{"name":"Raml Souk","code":"3624","wilaya":"الطارف"},{"name":"Souarekh","code":"3609","wilaya":"الطارف"},{"name":"Zerizer","code":"3619","wilaya":"الطارف"},{"name":"Zitouna","code":"3620","wilaya":"الطارف"},{"name":"Oum El Assel","code":"3702","wilaya":"تندوف"},{"name":"Tindouf","code":"3701","wilaya":"تندوف"},{"name":"Ammari","code":"3813","wilaya":"تيسمسيلت"},{"name":"Beni Chaib","code":"3805","wilaya":"تيسمسيلت"},{"name":"Beni Lahcene","code":"3822","wilaya":"تيسمسيلت"},{"name":"Bordj Bounaama","code":"3802","wilaya":"تيسمسيلت"},{"name":"Bordj El Emir Abdelkader","code":"3809","wilaya":"تيسمسيلت"},{"name":"Bou Caid","code":"3821","wilaya":"تيسمسيلت"},{"name":"Khemisti","code":"3811","wilaya":"تيسمسيلت"},{"name":"Larbaa","code":"3816","wilaya":"تيسمسيلت"},{"name":"Lardjem","code":"3806","wilaya":"تيسمسيلت"},{"name":"Layoune","code":"3810","wilaya":"تيسمسيلت"},{"name":"Lazharia","code":"3804","wilaya":"تيسمسيلت"},{"name":"Maacem","code":"3817","wilaya":"تيسمسيلت"},{"name":"Melaab","code":"3807","wilaya":"تيسمسيلت"},{"name":"Ouled Bessem","code":"3812","wilaya":"تيسمسيلت"},{"name":"Sidi Abed","code":"3818","wilaya":"تيسمسيلت"},{"name":"Sidi Boutouchent","code":"3815","wilaya":"تيسمسيلت"},{"name":"Sidi Lantri","code":"3808","wilaya":"تيسمسيلت"},{"name":"Sidi Slimane","code":"3820","wilaya":"تيسمسيلت"},{"name":"Tamellalet","code":"3819","wilaya":"تيسمسيلت"},{"name":"Theniet El Had","code":"3803","wilaya":"تيسمسيلت"},{"name":"Tissemsilt","code":"3801","wilaya":"تيسمسيلت"},{"name":"Youssoufia","code":"3814","wilaya":"تيسمسيلت"},{"name":"Bayadha","code":"3904","wilaya":"الوادي"},{"name":"Ben Guecha","code":"3919","wilaya":"الوادي"},{"name":"Debila","code":"3911","wilaya":"الوادي"},{"name":"Douar El Maa","code":"3915","wilaya":"الوادي"},{"name":"El Ogla","code":"3925","wilaya":"الوادي"},{"name":"El Oued","code":"3901","wilaya":"الوادي"},{"name":"Guemar","code":"3906","wilaya":"الوادي"},{"name":"Hamraia","code":"3909","wilaya":"الوادي"},{"name":"Hassani Abdelkrim","code":"3912","wilaya":"الوادي"},{"name":"Hassi Khalifa","code":"3913","wilaya":"الوادي"},{"name":"Kouinine","code":"3907","wilaya":"الوادي"},{"name":"Magrane","code":"3918","wilaya":"الوادي"},{"name":"Mih Ouansa","code":"3926","wilaya":"الوادي"},{"name":"Nakhla","code":"3905","wilaya":"الوادي"},{"name":"Oued El Alenda","code":"3903","wilaya":"الوادي"},{"name":"Ourmes","code":"3920","wilaya":"الوادي"},{"name":"Reguiba","code":"3908","wilaya":"الوادي"},{"name":"Robbah","code":"3902","wilaya":"الوادي"},{"name":"Sidi Aoun","code":"3916","wilaya":"الوادي"},{"name":"Taghzout","code":"3910","wilaya":"الوادي"},{"name":"Taleb Larbi","code":"3914","wilaya":"الوادي"},{"name":"Trifaoui","code":"3917","wilaya":"الوادي"},{"name":"Ain Touila","code":"4006","wilaya":"خنشلة"},{"name":"Babar","code":"4013","wilaya":"خنشلة"},{"name":"Baghai","code":"4004","wilaya":"خنشلة"},{"name":"Bouhmama","code":"4008","wilaya":"خنشلة"},{"name":"Chelia","code":"4021","wilaya":"خنشلة"},{"name":"Cherchar","code":"4011","wilaya":"خنشلة"},{"name":"Djellal","code":"4012","wilaya":"خنشلة"},{"name":"El Hamma","code":"4005","wilaya":"خنشلة"},{"name":"El Mahmal","code":"4017","wilaya":"خنشلة"},{"name":"El Oueldja","code":"4009","wilaya":"خنشلة"},{"name":"Ensigha","code":"4015","wilaya":"خنشلة"},{"name":"Kais","code":"4003","wilaya":"خنشلة"},{"name":"Khenchela","code":"4001","wilaya":"خنشلة"},{"name":"Khirane","code":"4020","wilaya":"خنشلة"},{"name":"M'sara","code":"4018","wilaya":"خنشلة"},{"name":"M'toussa","code":"4002","wilaya":"خنشلة"},{"name":"Ouled Rechache","code":"4016","wilaya":"خنشلة"},{"name":"Remila","code":"4010","wilaya":"خنشلة"},{"name":"Tamza","code":"4014","wilaya":"خنشلة"},{"name":"Taouzianat","code":"4007","wilaya":"خنشلة"},{"name":"Yabous","code":"4019","wilaya":"خنشلة"},{"name":"Ain Soltane","code":"4118","wilaya":"سوق أهراس"},{"name":"Ain Zana","code":"4117","wilaya":"سوق أهراس"},{"name":"Bir Bouhouche","code":"4114","wilaya":"سوق أهراس"},{"name":"Drea","code":"4109","wilaya":"سوق أهراس"},{"name":"Haddada","code":"4110","wilaya":"سوق أهراس"},{"name":"Hanencha","code":"4103","wilaya":"سوق أهراس"},{"name":"Khedara","code":"4111","wilaya":"سوق أهراس"},{"name":"Khemissa","code":"4123","wilaya":"سوق أهراس"},{"name":"M'daourouche","code":"4115","wilaya":"سوق أهراس"},{"name":"Machroha","code":"4104","wilaya":"سوق أهراس"},{"name":"Merahna","code":"4112","wilaya":"سوق أهراس"},{"name":"Oued Kebrit","code":"4124","wilaya":"سوق أهراس"},{"name":"Ouled Driss","code":"4105","wilaya":"سوق أهراس"},{"name":"Ouled Moumen","code":"4113","wilaya":"سوق أهراس"},{"name":"Oum El Adhaim","code":"4116","wilaya":"سوق أهراس"},{"name":"Quillen","code":"4119","wilaya":"سوق أهراس"},{"name":"Ragouba","code":"4122","wilaya":"سوق أهراس"},{"name":"Safel El Ouiden","code":"4121","wilaya":"سوق أهراس"},{"name":"Sedrata","code":"4102","wilaya":"سوق أهراس"},{"name":"Sidi Fredj","code":"4120","wilaya":"سوق أهراس"},{"name":"Souk Ahras","code":"4101","wilaya":"سوق أهراس"},{"name":"Taoura","code":"4108","wilaya":"سوق أهراس"},{"name":"Terraguelt","code":"4125","wilaya":"سوق أهراس"},{"name":"Tiffech","code":"4106","wilaya":"سوق أهراس"},{"name":"Zaarouria","code":"4107","wilaya":"سوق أهراس"},{"name":"Zouabi","code":"4126","wilaya":"سوق أهراس"},{"name":"Aghbal","code":"4207","wilaya":"تيبازة"},{"name":"Ahmer El Ain","code":"4219","wilaya":"تيبازة"},{"name":"Ain Tagourait","code":"4213","wilaya":"تيبازة"},{"name":"Attatba","code":"4225","wilaya":"تيبازة"},{"name":"Beni Mileuk","code":"4227","wilaya":"تيبازة"},{"name":"Bou Haroun","code":"4220","wilaya":"تيبازة"},{"name":"Bou Ismail","code":"4218","wilaya":"تيبازة"},{"name":"Bourkika","code":"4205","wilaya":"تيبازة"},{"name":"Chaiba","code":"4212","wilaya":"تيبازة"},{"name":"Cherchell","code":"4214","wilaya":"تيبازة"},{"name":"Damous","code":"4215","wilaya":"تيبازة"},{"name":"Douaouda","code":"4204","wilaya":"تيبازة"},{"name":"Fouka","code":"4217","wilaya":"تيبازة"},{"name":"Gouraya","code":"4210","wilaya":"تيبازة"},{"name":"Hadjout","code":"4208","wilaya":"تيبازة"},{"name":"Hadjret Ennous","code":"4228","wilaya":"تيبازة"},{"name":"Khemisti","code":"4206","wilaya":"تيبازة"},{"name":"Kolea","code":"4224","wilaya":"تيبازة"},{"name":"Larhat","code":"4203","wilaya":"تيبازة"},{"name":"Menaceur","code":"4202","wilaya":"تيبازة"},{"name":"Merad","code":"4216","wilaya":"تيبازة"},{"name":"Messelmoun","code":"4222","wilaya":"تيبازة"},{"name":"Nador","code":"4211","wilaya":"تيبازة"},{"name":"Sidi Amar","code":"4209","wilaya":"تيبازة"},{"name":"Sidi Ghiles","code":"4221","wilaya":"تيبازة"},{"name":"Sidi Rached","code":"4223","wilaya":"تيبازة"},{"name":"Sidi Semiane","code":"4226","wilaya":"تيبازة"},{"name":"Tipaza","code":"4201","wilaya":"تيبازة"},{"name":"Ahmed Rachedi","code":"4311","wilaya":"ميلة"},{"name":"Ain Beida Harriche","code":"4330","wilaya":"ميلة"},{"name":"Ain Mellouk","code":"4305","wilaya":"ميلة"},{"name":"Ain Tine","code":"4325","wilaya":"ميلة"},{"name":"Amira Arres","code":"4322","wilaya":"ميلة"},{"name":"Benyahia Abderrahmane","code":"4309","wilaya":"ميلة"},{"name":"Bouhatem","code":"4314","wilaya":"ميلة"},{"name":"Chelghoum Laid","code":"4303","wilaya":"ميلة"},{"name":"Chigara","code":"4332","wilaya":"ميلة"},{"name":"Derrahi Bousselah","code":"4320","wilaya":"ميلة"},{"name":"El Mechira","code":"4326","wilaya":"ميلة"},{"name":"Elayadi Barbes","code":"4329","wilaya":"ميلة"},{"name":"Ferdjioua","code":"4302","wilaya":"ميلة"},{"name":"Grarem Gouga","code":"4317","wilaya":"ميلة"},{"name":"Hamala","code":"4324","wilaya":"ميلة"},{"name":"Mila","code":"4301","wilaya":"ميلة"},{"name":"Minar Zarza","code":"4321","wilaya":"ميلة"},{"name":"Oued Athmenia","code":"4304","wilaya":"ميلة"},{"name":"Oued Endja","code":"4310","wilaya":"ميلة"},{"name":"Oued Seguen","code":"4307","wilaya":"ميلة"},{"name":"Ouled Khalouf","code":"4312","wilaya":"ميلة"},{"name":"Rouached","code":"4315","wilaya":"ميلة"},{"name":"Sidi Khelifa","code":"4327","wilaya":"ميلة"},{"name":"Sidi Merouane","code":"4318","wilaya":"ميلة"},{"name":"Tadjenanet","code":"4308","wilaya":"ميلة"},{"name":"Tassadane Haddada","code":"4319","wilaya":"ميلة"},{"name":"Teleghma","code":"4306","wilaya":"ميلة"},{"name":"Terrai Bainem","code":"4323","wilaya":"ميلة"},{"name":"Tessala","code":"4316","wilaya":"ميلة"},{"name":"Tiberguent","code":"4313","wilaya":"ميلة"},{"name":"Yahia Beniguecha","code":"4331","wilaya":"ميلة"},{"name":"Zeghaia","code":"4328","wilaya":"ميلة"},{"name":"Ain Benian","code":"4426","wilaya":"عين الدفلى"},{"name":"Ain Bouyahia","code":"4433","wilaya":"عين الدفلى"},{"name":"Ain Defla","code":"4401","wilaya":"عين الدفلى"},{"name":"Ain Lechiakh","code":"4414","wilaya":"عين الدفلى"},{"name":"Ain Soltane","code":"4420","wilaya":"عين الدفلى"},{"name":"Ain Tork","code":"4423","wilaya":"عين الدفلى"},{"name":"Arib","code":"4406","wilaya":"عين الدفلى"},{"name":"Barbouche","code":"4428","wilaya":"عين الدفلى"},{"name":"Bathia","code":"4431","wilaya":"عين الدفلى"},{"name":"Belaas","code":"4436","wilaya":"عين الدفلى"},{"name":"Ben Allal","code":"4425","wilaya":"عين الدفلى"},{"name":"Bir Ould Khelifa","code":"4419","wilaya":"عين الدفلى"},{"name":"Bordj Emir Khaled","code":"4422","wilaya":"عين الدفلى"},{"name":"Boumedfaa","code":"4403","wilaya":"عين الدفلى"},{"name":"Bourached","code":"4409","wilaya":"عين الدفلى"},{"name":"Djelida","code":"4407","wilaya":"عين الدفلى"},{"name":"Djemaa Ouled Cheikh","code":"4429","wilaya":"عين الدفلى"},{"name":"Djendel","code":"4412","wilaya":"عين الدفلى"},{"name":"El Abadia","code":"4411","wilaya":"عين الدفلى"},{"name":"El Amra","code":"4408","wilaya":"عين الدفلى"},{"name":"El Attaf","code":"4410","wilaya":"عين الدفلى"},{"name":"El Maine","code":"4434","wilaya":"عين الدفلى"},{"name":"Hammam Righa","code":"4405","wilaya":"عين الدفلى"},{"name":"Hassania","code":"4418","wilaya":"عين الدفلى"},{"name":"Hoceinia","code":"4427","wilaya":"عين الدفلى"},{"name":"Khemis Miliana","code":"4404","wilaya":"عين الدفلى"},{"name":"Mekhatria","code":"4430","wilaya":"عين الدفلى"},{"name":"Miliana","code":"4402","wilaya":"عين الدفلى"},{"name":"Oued Chorfa","code":"4413","wilaya":"عين الدفلى"},{"name":"Oued Djemaa","code":"4415","wilaya":"عين الدفلى"},{"name":"Rouina","code":"4416","wilaya":"عين الدفلى"},{"name":"Sidi Lakhdar","code":"4424","wilaya":"عين الدفلى"},{"name":"Tacheta Zegagha","code":"4432","wilaya":"عين الدفلى"},{"name":"Tarik Ibn Ziad","code":"4421","wilaya":"عين الدفلى"},{"name":"Tiberkanine","code":"4435","wilaya":"عين الدفلى"},{"name":"Zeddine","code":"4417","wilaya":"عين الدفلى"},{"name":"Ain Ben Khelil","code":"4509","wilaya":"النعامة"},{"name":"Ain Safra","code":"4503","wilaya":"النعامة"},{"name":"Assela","code":"4507","wilaya":"النعامة"},{"name":"Djeniane Bourzeg","code":"4508","wilaya":"النعامة"},{"name":"El Biod","code":"4512","wilaya":"النعامة"},{"name":"Kasdir","code":"4511","wilaya":"النعامة"},{"name":"Makman Ben Amer","code":"4510","wilaya":"النعامة"},{"name":"Mecheria","code":"4502","wilaya":"النعامة"},{"name":"Moghrar","code":"4506","wilaya":"النعامة"},{"name":"Naama","code":"4501","wilaya":"النعامة"},{"name":"Sfissifa","code":"4505","wilaya":"النعامة"},{"name":"Tiout","code":"4504","wilaya":"النعامة"},{"name":"Aghlal","code":"4607","wilaya":"عين تموشنت"},{"name":"Ain El Arbaa","code":"4609","wilaya":"عين تموشنت"},{"name":"Ain Kihal","code":"4603","wilaya":"عين تموشنت"},{"name":"Ain Temouchent","code":"4601","wilaya":"عين تموشنت"},{"name":"Ain Tolba","code":"4618","wilaya":"عين تموشنت"},{"name":"Aoubellil","code":"4613","wilaya":"عين تموشنت"},{"name":"Beni Saf","code":"4623","wilaya":"عين تموشنت"},{"name":"Bouzedjar","code":"4605","wilaya":"عين تموشنت"},{"name":"Chaabat El Ham","code":"4602","wilaya":"عين تموشنت"},{"name":"Chentouf","code":"4611","wilaya":"عين تموشنت"},{"name":"El Amria","code":"4619","wilaya":"عين تموشنت"},{"name":"El Malah","code":"4614","wilaya":"عين تموشنت"},{"name":"El Messaid","code":"4628","wilaya":"عين تموشنت"},{"name":"Emir Abdelkader","code":"4627","wilaya":"عين تموشنت"},{"name":"Hammam Bouhadjar","code":"4604","wilaya":"عين تموشنت"},{"name":"Hassasna","code":"4621","wilaya":"عين تموشنت"},{"name":"Hassi El Ghella","code":"4620","wilaya":"عين تموشنت"},{"name":"Oued Berkeche","code":"4606","wilaya":"عين تموشنت"},{"name":"Oued Sebbah","code":"4616","wilaya":"عين تموشنت"},{"name":"Ouled Boudjemaa","code":"4617","wilaya":"عين تموشنت"},{"name":"Ouled Kihal","code":"4622","wilaya":"عين تموشنت"},{"name":"Oulhaca El Gheraba","code":"4625","wilaya":"عين تموشنت"},{"name":"Sidi Ben Adda","code":"4612","wilaya":"عين تموشنت"},{"name":"Sidi Boumediene","code":"4615","wilaya":"عين تموشنت"},{"name":"Sidi Ouriache","code":"4626","wilaya":"عين تموشنت"},{"name":"Sidi Safi","code":"4624","wilaya":"عين تموشنت"},{"name":"Tamzoura","code":"4610","wilaya":"عين تموشنت"},{"name":"Terga","code":"4608","wilaya":"عين تموشنت"},{"name":"Berriane","code":"4704","wilaya":"غرداية"},{"name":"Bounoura","code":"4710","wilaya":"غرداية"},{"name":"Dhayet Bendhahoua","code":"4703","wilaya":"غرداية"},{"name":"El Atteuf","code":"4707","wilaya":"غرداية"},{"name":"El Guerrara","code":"4706","wilaya":"غرداية"},{"name":"Ghardaia","code":"4701","wilaya":"غرداية"},{"name":"Mansoura","code":"4713","wilaya":"غرداية"},{"name":"Metlili","code":"4705","wilaya":"غرداية"},{"name":"Sebseb","code":"4709","wilaya":"غرداية"},{"name":"Zelfana","code":"4708","wilaya":"غرداية"},{"name":"Ain Rahma","code":"4824","wilaya":"غليزان"},{"name":"Ain Tarek","code":"4819","wilaya":"غليزان"},{"name":"Ammi Moussa","code":"4811","wilaya":"غليزان"},{"name":"Belaassel Bouzagza","code":"4803","wilaya":"غليزان"},{"name":"Bendaoud","code":"4835","wilaya":"غليزان"},{"name":"Beni Dergoun","code":"4813","wilaya":"غليزان"},{"name":"Beni Zentis","code":"4830","wilaya":"غليزان"},{"name":"Dar Ben Abdelah","code":"4832","wilaya":"غليزان"},{"name":"Djidiouia","code":"4814","wilaya":"غليزان"},{"name":"El Guettar","code":"4815","wilaya":"غليزان"},{"name":"El H'madna","code":"4807","wilaya":"غليزان"},{"name":"El Hassi","code":"4833","wilaya":"غليزان"},{"name":"El Matmar","code":"4817","wilaya":"غليزان"},{"name":"El Ouldja","code":"4836","wilaya":"غليزان"},{"name":"Had Echkalla","code":"4834","wilaya":"غليزان"},{"name":"Hamri","code":"4816","wilaya":"غليزان"},{"name":"Kalaa","code":"4823","wilaya":"غليزان"},{"name":"Lahlef","code":"4829","wilaya":"غليزان"},{"name":"Mazouna","code":"4822","wilaya":"غليزان"},{"name":"Mediouna","code":"4809","wilaya":"غليزان"},{"name":"Mendes","code":"4828","wilaya":"غليزان"},{"name":"Merdja Sidi Abed","code":"4837","wilaya":"غليزان"},{"name":"Ouarizane","code":"4821","wilaya":"غليزان"},{"name":"Oued El Djemaa","code":"4826","wilaya":"غليزان"},{"name":"Oued Essalem","code":"4820","wilaya":"غليزان"},{"name":"Oued Rhiou","code":"4802","wilaya":"غليزان"},{"name":"Ouled Aiche","code":"4805","wilaya":"غليزان"},{"name":"Ouled Sidi Mihoub","code":"4838","wilaya":"غليزان"},{"name":"Ramka","code":"4827","wilaya":"غليزان"},{"name":"Relizane","code":"4801","wilaya":"غليزان"},{"name":"Sidi Khettab","code":"4810","wilaya":"غليزان"},{"name":"Sidi Lazreg","code":"4806","wilaya":"غليزان"},{"name":"Sidi M'hamed Benali","code":"4808","wilaya":"غليزان"},{"name":"Sidi M'hamed Benaouda","code":"4818","wilaya":"غليزان"},{"name":"Sidi Saada","code":"4804","wilaya":"غليزان"},{"name":"Souk El Had","code":"4831","wilaya":"غليزان"},{"name":"Yellel","code":"4825","wilaya":"غليزان"},{"name":"Zemmoura","code":"4812","wilaya":"غليزان"},{"name":"Aougrout","code":"4908","wilaya":"تيميمون"},{"name":"Charouine","code":"4902","wilaya":"تيميمون"},{"name":"Deldoul","code":"4906","wilaya":"تيميمون"},{"name":"Ksar Kaddour","code":"4903","wilaya":"تيميمون"},{"name":"Metarfa","code":"4907","wilaya":"تيميمون"},{"name":"Ouled Aissa","code":"4910","wilaya":"تيميمون"},{"name":"Ouled Said","code":"4904","wilaya":"تيميمون"},{"name":"Talmine","code":"4909","wilaya":"تيميمون"},{"name":"Timimoun","code":"4901","wilaya":"تيميمون"},{"name":"Tinerkouk","code":"4905","wilaya":"تيميمون"},{"name":"Bordj Badji Mokhtar","code":"5001","wilaya":"برج باجي مختار"},{"name":"Timiaouine","code":"5002","wilaya":"برج باجي مختار"},{"name":"Besbes","code":"5103","wilaya":"أولاد جلال"},{"name":"Chaiba","code":"5106","wilaya":"أولاد جلال"},{"name":"Doucen","code":"5105","wilaya":"أولاد جلال"},{"name":"Ouled Djellal","code":"5101","wilaya":"أولاد جلال"},{"name":"Ras El Miad","code":"5102","wilaya":"أولاد جلال"},{"name":"Sidi Khaled","code":"5104","wilaya":"أولاد جلال"},{"name":"Beni Abbes","code":"5201","wilaya":"بني عباس"},{"name":"Beni Ikhlef","code":"5204","wilaya":"بني عباس"},{"name":"El Ouata","code":"5207","wilaya":"بني عباس"},{"name":"Igli","code":"5205","wilaya":"بني عباس"},{"name":"Kerzaz","code":"5208","wilaya":"بني عباس"},{"name":"Ksabi","code":"5209","wilaya":"بني عباس"},{"name":"Ouled Khoudir","code":"5202","wilaya":"بني عباس"},{"name":"Tabelbala","code":"5206","wilaya":"بني عباس"},{"name":"Tamtert","code":"5210","wilaya":"بني عباس"},{"name":"Timoudi","code":"5203","wilaya":"بني عباس"},{"name":"Foggaret Azzaouia","code":"5303","wilaya":"عين صالح"},{"name":"In Ghar","code":"5302","wilaya":"عين صالح"},{"name":"In Salah","code":"5301","wilaya":"عين صالح"},{"name":"In Guezzam","code":"5401","wilaya":"عين قزام"},{"name":"Tin Zouatine","code":"5402","wilaya":"عين قزام"},{"name":"Benaceur","code":"5510","wilaya":"تقرت"},{"name":"Blidet Amor","code":"5502","wilaya":"تقرت"},{"name":"El Alia","code":"5513","wilaya":"تقرت"},{"name":"El Hadjira","code":"5507","wilaya":"تقرت"},{"name":"Megarine","code":"5512","wilaya":"تقرت"},{"name":"Mnaguer","code":"5511","wilaya":"تقرت"},{"name":"Nezla","code":"5504","wilaya":"تقرت"},{"name":"Sidi Slimane","code":"5506","wilaya":"تقرت"},{"name":"Taibet","code":"5508","wilaya":"تقرت"},{"name":"Tebesbest","code":"5503","wilaya":"تقرت"},{"name":"Temacine","code":"5509","wilaya":"تقرت"},{"name":"Touggourt","code":"5501","wilaya":"تقرت"},{"name":"Zaouia El Abidia","code":"5505","wilaya":"تقرت"},{"name":"برج الحواس","code":"5602","wilaya":"جانت"},{"name":"جانت","code":"5601","wilaya":"جانت"},{"name":"جامعة","code":"5706","wilaya":"المغير"},{"name":"المغير","code":"5701","wilaya":"المغير"},{"name":"المرارة","code":"5703","wilaya":"المغير"},{"name":"أم الطيور","code":"5707","wilaya":"المغير"},{"name":"سيدي عمران","code":"5708","wilaya":"المغير"},{"name":"سيدي خليل","code":"5704","wilaya":"المغير"},{"name":"سطيل","code":"5702","wilaya":"المغير"},{"name":"تندلة","code":"5705","wilaya":"المغير"},{"name":"المنيعة","code":"5801","wilaya":"المنيعة"},{"name":"حاسي الفحل","code":"5802","wilaya":"المنيعة"},{"name":"حاسي القارة","code":"5803","wilaya":"المنيعة"}]};
-const I18N={ar:{top:'توصيل إلى 58 ولاية • الدفع عند الاستلام',welcome:'تسوّق بسهولة وأمان',home:'الرئيسية',products:'المنتجات',why:'لماذا نحن',order:'اطلب الآن',cart:'السلة',eyebrow:'اختيارات مميزة • جودة تستحقها',heroTitle:'كل ما تحبّه،<br>في مكان واحد.',heroDesc:'اكتشف منتجات مختارة بعناية، تجربة شراء سهلة، وخيارات توصيل تناسبك أينما كنت في الجزائر.',shopNow:'اكتشف المنتجات ←',orderNow:'اطلب الآن',quality:'جودة • ثقة • سرعة',productsTitle:'منتجاتنا',productsSub:'تسوّق مجموعتنا المختارة بسهولة.',all:'الكل',homeCat:'المنزل',styleCat:'الأناقة',techCat:'الإلكترونيات',benefit1:'توصيل مرن',benefit1s:'إلى المنزل أو مكتب التوصيل',benefit2:'طلب آمن',benefit2s:'بيانات طلبك تبقى في هذا النموذج التجريبي',benefit3:'خدمة تهتم بك',benefit3s:'تجربة بسيطة وواضحة',orderTitle:'أكمل طلبك',orderSub:'أدخل معلوماتك واختر طريقة التوصيل المناسبة.',fullName:'الاسم الكامل',phone:'رقم الهاتف',wilaya:'الولاية',commune:'البلدية',chooseWilaya:'اختر الولاية',chooseCommune:'اختر البلدية',deliveryType:'نوع التوصيل',homeDelivery:'إلى المنزل',officeDelivery:'إلى المكتب',address:'العنوان بالتفصيل',notes:'ملاحظات (اختياري)',itemsTotal:'مجموع المنتجات',deliveryFee:'سعر التوصيل',grandTotal:'المجموع النهائي',confirm:'تأكيد الطلب التجريبي',demoNote:'هذا نموذج تجريبي: لا يتم إرسال الطلب إلى شركة توصيل أو حفظه على خادم.',rights:'جميع الحقوق محفوظة',footer:'واجهة تجريبية قابلة للتخصيص',yourCart:'سلة المشتريات',checkout:'متابعة الطلب',adminTitle:'لوحة التحكم',adminSub:'إدارة تجريبية للمتجر',adminPassword:'أدخل كلمة مرور الإدارة التجريبية',login:'دخول',overview:'نظرة عامة',fees:'أسعار التوصيل',orders:'الطلبات',manageProducts:'المنتجات',ordersCount:'عدد الطلبات',sales:'قيمة الطلبات',productsCount:'المنتجات',localNotice:'البيانات تحفظ محلياً في متصفحك فقط عبر LocalStorage.',feesTitle:'تعديل سعر التوصيل حسب الولاية',feesHint:'الأسعار التالية تجريبية بالدينار الجزائري، عدّلها حسب شركة التوصيل.',save:'حفظ الأسعار',ordersTitle:'الطلبات المسجلة',customer:'العميل',productEditHint:'تستطيع تعديل الاسم والسعر من الكود؛ إضافة وحذف المنتجات من لوحة الإدارة التجريبية.',newProduct:'اسم المنتج',price:'السعر (دج)',category:'التصنيف',addProduct:'إضافة منتج',added:'تمت إضافة المنتج',removed:'تم حذف المنتج',saved:'تم حفظ الأسعار',loginFail:'كلمة المرور غير صحيحة',addedCart:'أضيف المنتج إلى السلة',empty:'السلة فارغة حالياً',noOrders:'لا توجد طلبات بعد',noProducts:'لا توجد منتجات',orderSuccess:'تم تسجيل الطلب التجريبي بنجاح',selectError:'يرجى اختيار الولاية والبلدية',homeAddress:'العنوان مطلوب للتوصيل إلى المنزل',choose:'اختر',delete:'حذف',product:'منتج',popular:'الأكثر طلباً',description:'اختيار عملي بجودة ممتازة للاستخدام اليومي.'},fr:{top:'Livraison dans 58 wilayas • Paiement à la livraison',welcome:'Achetez simplement et en toute confiance',home:'Accueil',products:'Produits',why:'Pourquoi nous',order:'Commander',cart:'Panier',eyebrow:'Sélection spéciale • Qualité au rendez-vous',heroTitle:'Tout ce que vous aimez,<br>au même endroit.',heroDesc:'Découvrez une sélection de produits, une expérience d’achat simple et des options de livraison partout en Algérie.',shopNow:'Découvrir les produits →',orderNow:'Commander',quality:'Qualité • Confiance • Rapidité',productsTitle:'Nos produits',productsSub:'Découvrez facilement notre sélection.',all:'Tout',homeCat:'Maison',styleCat:'Style',techCat:'Électronique',benefit1:'Livraison flexible',benefit1s:'À domicile ou au bureau',benefit2:'Commande simple',benefit2s:'Données conservées dans cette démo',benefit3:'À votre service',benefit3s:'Une expérience claire et simple',orderTitle:'Finaliser la commande',orderSub:'Renseignez vos informations et choisissez la livraison.',fullName:'Nom complet',phone:'Téléphone',wilaya:'Wilaya',commune:'Commune',chooseWilaya:'Choisir une wilaya',chooseCommune:'Choisir une commune',deliveryType:'Type de livraison',homeDelivery:'À domicile',officeDelivery:'Au bureau',address:'Adresse détaillée',notes:'Remarques (facultatif)',itemsTotal:'Sous-total produits',deliveryFee:'Frais de livraison',grandTotal:'Total à payer',confirm:'Confirmer la commande test',demoNote:'Démo uniquement : aucune commande n’est envoyée au transporteur ni à un serveur.',rights:'Tous droits réservés',footer:'Interface de démonstration personnalisable',yourCart:'Votre panier',checkout:'Continuer',adminTitle:'Tableau de bord',adminSub:'Administration de démonstration',adminPassword:'Mot de passe administrateur de démonstration',login:'Connexion',overview:'Vue générale',fees:'Tarifs livraison',orders:'Commandes',manageProducts:'Produits',ordersCount:'Commandes',sales:'Valeur des commandes',productsCount:'Produits',localNotice:'Les données sont stockées localement dans votre navigateur via LocalStorage.',feesTitle:'Modifier les frais par wilaya',feesHint:'Tarifs fictifs en dinars algériens, à adapter au transporteur.',save:'Enregistrer',ordersTitle:'Commandes enregistrées',customer:'Client',productEditHint:'Modifiez les produits dans le code ; ajoutez ou supprimez ici dans cette démo.',newProduct:'Nom du produit',price:'Prix (DA)',category:'Catégorie',addProduct:'Ajouter',added:'Produit ajouté',removed:'Produit supprimé',saved:'Tarifs enregistrés',loginFail:'Mot de passe incorrect',addedCart:'Ajouté au panier',empty:'Votre panier est vide',noOrders:'Aucune commande',noProducts:'Aucun produit',orderSuccess:'Commande test enregistrée',selectError:'Veuillez choisir wilaya et commune',homeAddress:'Adresse obligatoire pour livraison à domicile',choose:'Choisir',delete:'Supprimer',product:'Produit',popular:'Populaire',description:'Un choix pratique et de qualité pour le quotidien.'}};
-const baseProducts=[{id:1,name:'طقم منزلي أنيق',fr:'Ensemble maison élégant',price:4200,cat:'home',img:'https://images.unsplash.com/photo-1616486338812-3dadae4b4ace?auto=format&fit=crop&w=700&q=80'},{id:2,name:'ساعة عصرية',fr:'Montre moderne',price:5800,cat:'style',img:'https://images.unsplash.com/photo-1523275335684-37898b6baf30?auto=format&fit=crop&w=700&q=80'},{id:3,name:'سماعات لاسلكية',fr:'Écouteurs sans fil',price:3500,cat:'tech',img:'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?auto=format&fit=crop&w=700&q=80'},{id:4,name:'حقيبة يومية',fr:'Sac quotidien',price:4600,cat:'style',img:'https://images.unsplash.com/photo-1548036328-c9fa89d128fa?auto=format&fit=crop&w=700&q=80'},{id:5,name:'مصباح ديكور',fr:'Lampe décorative',price:2900,cat:'home',img:'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=700&q=80'},{id:6,name:'ساعة ذكية',fr:'Montre connectée',price:8900,cat:'tech',img:'https://images.unsplash.com/photo-1523275335684-37898b6baf30?auto=format&fit=crop&w=700&q=80'},{id:7,name:'نظارات شمسية',fr:'Lunettes de soleil',price:2400,cat:'style',img:'https://images.unsplash.com/photo-1511499767150-a48a237f0083?auto=format&fit=crop&w=700&q=80'},{id:8,name:'إكسسوارات منزلية',fr:'Accessoires maison',price:1800,cat:'home',img:'https://images.unsplash.com/photo-1600210492486-724fe5c67fb0?auto=format&fit=crop&w=700&q=80'}];
-const $=s=>document.querySelector(s);let lang='ar',category='all',products=JSON.parse(localStorage.getItem('ofoq_products')||'null')||baseProducts,cart=JSON.parse(localStorage.getItem('ofoq_cart')||'{}'),orders=JSON.parse(localStorage.getItem('ofoq_orders')||'[]'),fees=JSON.parse(localStorage.getItem('ofoq_fees')||'{}');const money=n=>Number(n||0).toLocaleString(lang==='ar'?'ar-DZ':'fr-FR')+' دج';const tr=k=>I18N[lang][k]||k;const wilayaName=w=>lang==='fr'?w.fr:w.name;const byWilaya=w=>DATA.municipalities.filter(m=>m.wilaya===w);
-function setLang(){document.documentElement.lang=lang;document.documentElement.dir=lang==='ar'?'rtl':'ltr';document.querySelectorAll('[data-i]').forEach(el=>{let k=el.dataset.i;if(I18N[lang][k])el.innerHTML=I18N[lang][k]});$('#langBtn').textContent=lang==='ar'?'FR':'AR';renderProducts();renderCart();renderWilayas();calcTotals();}
-function renderProducts(){let list=products.filter(p=>category==='all'||p.cat===category);$('#productGrid').innerHTML=list.map(p=>`<article class="product"><div class="pimg"><img src="${p.img||'https://images.unsplash.com/photo-1542291026-7eec264c27ff?auto=format&fit=crop&w=700&q=80'}" alt="${p.name}"><span class="tag">${tr('popular')}</span></div><div class="pbody"><h3>${lang==='fr'?(p.fr||p.name):p.name}</h3><p>${tr('description')}</p><div class="pfoot"><span class="price">${money(p.price)}</span><button class="add" onclick="addCart(${p.id})">+</button></div></div></article>`).join('')||`<p>${tr('noProducts')}</p>`;}
-function addCart(id){cart[id]=(cart[id]||0)+1;save();renderCart();toast(tr('addedCart'));}function save(){localStorage.setItem('ofoq_cart',JSON.stringify(cart));localStorage.setItem('ofoq_products',JSON.stringify(products));localStorage.setItem('ofoq_orders',JSON.stringify(orders));localStorage.setItem('ofoq_fees',JSON.stringify(fees));}function subtotal(){return products.reduce((s,p)=>s+p.price*(cart[p.id]||0),0)}function renderCart(){let n=Object.values(cart).reduce((a,b)=>a+b,0);$('#cartCount').textContent=n;$('#cartLines').innerHTML=n?products.filter(p=>cart[p.id]).map(p=>`<div class="cartline"><img src="${p.img}" alt=""><div><b>${lang==='fr'?(p.fr||p.name):p.name}</b><div class="qty"><button onclick="changeQty(${p.id},-1)">−</button>${cart[p.id]}<button onclick="changeQty(${p.id},1)">+</button></div></div><b>${money(p.price*cart[p.id])}</b></div>`).join(''):`<div class="empty">🛒<p>${tr('empty')}</p></div>`;$('#cartTotal').textContent=money(subtotal());$('#itemsTotal').textContent=money(subtotal());}function changeQty(id,d){cart[id]=(cart[id]||0)+d;if(cart[id]<=0)delete cart[id];save();renderCart();}
-function renderWilayas(){let sel=$('#wilaya'),v=sel.value;sel.innerHTML=`<option value="">${tr('chooseWilaya')}</option>`+DATA.wilayas.map(w=>`<option value="${w.name}">${wilayaName(w)}</option>`).join('');if(v)sel.value=v;renderCommunes();}function renderCommunes(){let w=$('#wilaya').value,sel=$('#commune');sel.disabled=!w;sel.innerHTML=`<option value="">${tr('chooseCommune')}</option>`+byWilaya(w).map(m=>`<option value="${m.name}" data-code="${m.code||''}">${m.name}${m.code?' — '+m.code:''}</option>`).join('');calcTotals();}function deliveryPrice(){let w=$('#wilaya').value;if(!w)return 0;let type=document.querySelector('input[name=delivery]:checked').value;let f=fees[w]||{};return Number(f[type]??(type==='home'?900:600));}function calcTotals(){let fee=deliveryPrice();$('#deliveryFee').textContent=money(fee);$('#itemsTotal').textContent=money(subtotal());$('#grandTotal').textContent=money(subtotal()+fee);$('#addressField').classList.toggle('hidden',document.querySelector('input[name=delivery]:checked').value!=='home');}
-function toast(s){$('#toast').textContent=s;$('#toast').classList.add('show');setTimeout(()=>$('#toast').classList.remove('show'),2300)}
-$('#langBtn').onclick=()=>{lang=lang==='ar'?'fr':'ar';setLang()};$('#filters').onclick=e=>{let b=e.target.closest('[data-cat]');if(!b)return;category=b.dataset.cat;document.querySelectorAll('.chip').forEach(x=>x.classList.toggle('active',x===b));renderProducts()};$('#cartBtn').onclick=()=>$('#cartOverlay').classList.add('show');$('#closeCart').onclick=()=>$('#cartOverlay').classList.remove('show');$('#cartOverlay').onclick=e=>{if(e.target.id==='cartOverlay')$('#cartOverlay').classList.remove('show')};$('#goCheckout').onclick=()=>{$('#cartOverlay').classList.remove('show');$('#order').scrollIntoView({behavior:'smooth'})};$('#wilaya').onchange=renderCommunes;$('#commune').onchange=calcTotals;document.querySelectorAll('input[name=delivery]').forEach(x=>x.onchange=calcTotals);
-$('#orderForm').onsubmit=e=>{e.preventDefault();if(!Object.values(cart).some(Boolean)){toast(tr('empty'));return}let w=DATA.wilayas.find(x=>x.name===$('#wilaya').value),comm=$('#commune').value;if(!w||!comm){toast(tr('selectError'));return}let type=document.querySelector('input[name=delivery]:checked').value;if(type==='home'&&!$('#address').value.trim()){toast(tr('homeAddress'));$('#address').focus();return}let fee=deliveryPrice(),items=products.filter(p=>cart[p.id]).map(p=>({name:p.name,qty:cart[p.id],price:p.price}));orders.unshift({id:Date.now(),name:$('#customerName').value,phone:$('#phone').value,wilaya:w.name,commune:comm,type,address:$('#address').value,items,total:subtotal()+fee,fee,date:new Date().toLocaleString()});cart={};save();renderCart();calcTotals();e.target.reset();renderCommunes();toast(tr('orderSuccess'));};
-$('#adminBtn').onclick=()=>{$('#adminModal').classList.add('show');$('#adminLogin').classList.remove('hidden');$('#adminPanel').classList.add('hidden')};$('#closeAdmin').onclick=()=>$('#adminModal').classList.remove('show');$('#adminModal').onclick=e=>{if(e.target.id==='adminModal')$('#adminModal').classList.remove('show')};$('#loginBtn').onclick=()=>{if($('#adminPass').value==='demo1234'){$('#adminLogin').classList.add('hidden');$('#adminPanel').classList.remove('hidden');renderAdmin()}else toast(tr('loginFail'))};document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));['overview','fees','orders','products'].forEach(t=>$('#tab-'+t).classList.toggle('hidden',t!==b.dataset.tab));renderAdmin()});
-function renderAdmin(){$('#statOrders').textContent=orders.length;$('#statSales').textContent=money(orders.reduce((s,o)=>s+o.total,0));$('#statProducts').textContent=products.length;$('#feesTable').innerHTML=DATA.wilayas.map(w=>{let f=fees[w.name]||{};return `<tr><td>${wilayaName(w)}</td><td><input class="adminInput" type="number" min="0" data-w="${w.name}" data-t="home" value="${f.home??900}"></td><td><input class="adminInput" type="number" min="0" data-w="${w.name}" data-t="office" value="${f.office??600}"></td></tr>`}).join('');$('#ordersTable').innerHTML=orders.map(o=>`<tr><td>${o.id.toString().slice(-6)}</td><td>${o.name}</td><td>${o.phone}</td><td>${o.wilaya} / ${o.commune}</td><td>${money(o.total)}</td></tr>`).join('')||`<tr><td colspan="5">${tr('noOrders')}</td></tr>`;$('#adminProducts').innerHTML=products.map(p=>`<div style="display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #eee;padding:10px 0;font-size:13px"><span>${p.name} — ${money(p.price)}</span><button class="chip" onclick="removeProduct(${p.id})">${tr('delete')}</button></div>`).join('')}
-$('#saveFees').onclick=()=>{document.querySelectorAll('[data-w][data-t]').forEach(i=>{fees[i.dataset.w]??={};fees[i.dataset.w][i.dataset.t]=Number(i.value)});save();calcTotals();toast(tr('saved'))};$('#addProduct').onclick=()=>{let name=$('#newProduct').value.trim(),price=Number($('#newPrice').value);if(!name||price<=0)return;products.push({id:Date.now(),name,fr:name,price,cat:$('#newCategory').value,img:'https://images.unsplash.com/photo-1542291026-7eec264c27ff?auto=format&fit=crop&w=700&q=80'});save();$('#newProduct').value='';$('#newPrice').value='';renderProducts();renderAdmin();toast(tr('added'))};function removeProduct(id){products=products.filter(p=>p.id!==id);delete cart[id];save();renderProducts();renderCart();renderAdmin();toast(tr('removed'))}
-renderWilayas();renderProducts();renderCart();calcTotals();
-</script></body></html>
+/* =========================================
+   6. سلة المشتريات وإرسال الطلب
+========================================= */
+
+const products = <?= json_encode(
+    array_map(function($p) {
+        return [
+            "id" => (int)$p["id"],
+            "name" => $p["name"],
+            "price" => (float)$p["price"]
+        ];
+    }, $products),
+    JSON_UNESCAPED_UNICODE
+) ?>;
+
+let cart = {};
+
+try {
+    cart = JSON.parse(localStorage.getItem("ofoq_cart") || "{}") || {};
+} catch(e) {
+    cart = {};
+}
+
+function saveCart() {
+    localStorage.setItem("ofoq_cart", JSON.stringify(cart));
+}
+
+function getProduct(id) {
+    return products.find(p => p.id === Number(id));
+}
+
+function money(n) {
+    return Number(n).toLocaleString("fr-FR") + " دج";
+}
+
+function subtotal() {
+    return products.reduce((sum,p) => {
+        return sum + p.price * (Number(cart[p.id]) || 0);
+    }, 0);
+}
+
+function addToCart(id) {
+    cart[id] = (Number(cart[id]) || 0) + 1;
+    saveCart();
+    renderCart();
+}
+
+function changeQty(id, amount) {
+    cart[id] = (Number(cart[id]) || 0) + amount;
+
+    if (cart[id] <= 0) {
+        delete cart[id];
+    }
+
+    saveCart();
+    renderCart();
+}
+
+function renderCart() {
+    const lines = document.getElementById("cartLines");
+    if (!lines) return;
+
+    const entries = products.filter(p => Number(cart[p.id]) > 0);
+
+    document.getElementById("cartCount").textContent =
+        Object.values(cart).reduce((a,b) => a + Number(b), 0);
+
+    if (!entries.length) {
+        lines.textContent = "السلة فارغة حالياً";
+    } else {
+        lines.innerHTML = "";
+
+        entries.forEach(p => {
+            const row = document.createElement("div");
+            row.className = "cart-row";
+
+            const name = document.createElement("span");
+            name.textContent = p.name + " — " + money(p.price * cart[p.id]);
+
+            const qty = document.createElement("span");
+            qty.className = "qty";
+
+            const minus = document.createElement("button");
+            minus.type = "button";
+            minus.textContent = "−";
+            minus.onclick = () => changeQty(p.id,-1);
+
+            const number = document.createElement("b");
+            number.textContent = cart[p.id];
+
+            const plus = document.createElement("button");
+            plus.type = "button";
+            plus.textContent = "+";
+            plus.onclick = () => changeQty(p.id,1);
+
+            qty.append(minus,number,plus);
+            row.append(name,qty);
+            lines.appendChild(row);
+        });
+    }
+
+    document.getElementById("cartTotal").textContent = money(subtotal());
+    updateTotal();
+}
+
+function updateTotal() {
+    const delivery = document.getElementById("deliveryType");
+    if (!delivery) return;
+
+    const fee = delivery.value === "home" ? 900 : 600;
+
+    document.getElementById("deliveryPrice").textContent = money(fee);
+    document.getElementById("finalTotal").textContent =
+        money(subtotal() + fee);
+
+    document.getElementById("addressBox").style.display =
+        delivery.value === "home" ? "block" : "none";
+}
+
+const deliverySelect = document.getElementById("deliveryType");
+
+if (deliverySelect) {
+    deliverySelect.addEventListener("change",updateTotal);
+}
+
+const orderForm = document.getElementById("orderForm");
+
+if (orderForm) {
+    orderForm.addEventListener("submit", function(e) {
+        if (subtotal() <= 0) {
+            e.preventDefault();
+            alert("أضف منتجاً واحداً على الأقل إلى السلة");
+            return;
+        }
+
+        document.getElementById("cartInput").value =
+            JSON.stringify(cart);
+
+        const button = orderForm.querySelector('button[type="submit"]');
+        button.disabled = true;
+        button.textContent = "جارٍ إرسال الطلب...";
+    });
+}
+
+renderCart();
+updateTotal();
+
+<?php if (isset($_GET["success"])): ?>
+alert("تم استلام طلبك بنجاح. رقم الطلب: #<?= (int)($_SESSION["last_order"] ?? 0) ?>");
+localStorage.removeItem("ofoq_cart");
+<?php endif; ?>
+</script>
+
+</body>
+</html>
